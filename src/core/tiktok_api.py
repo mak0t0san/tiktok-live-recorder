@@ -316,9 +316,13 @@ class TikTokAPI:
             logger.warning(f"Failed to extract stream URL from page: {e}")
             return None
 
-    def get_live_url(self, room_id: str, user: str = None) -> str | None:
+    def _add_live_url_candidate(self, candidates: list[str], url: str | None) -> None:
+        if url and url not in candidates:
+            candidates.append(url)
+
+    def get_live_urls(self, room_id: str, user: str = None) -> list[str]:
         """
-        Return the cdn (flv or m3u8) of the streaming.
+        Return candidate CDN URLs (flv or m3u8) for the streaming.
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
         """
@@ -338,7 +342,7 @@ class TikTokAPI:
                 )
                 fallback_url = self._get_stream_url_from_page(user)
                 if fallback_url:
-                    return fallback_url
+                    return [fallback_url]
 
             raise UserLiveError(TikTokError.LIVE_RESTRICTION)
 
@@ -354,17 +358,17 @@ class TikTokAPI:
             .get("pull_data", {})
             .get("stream_data")
         )
+        candidates = []
         if not sdk_data_str:
             logger.warning(
                 "No SDK stream data found. Falling back to legacy URLs. Consider contacting the developer to update the code."
             )
-            return (
-                stream_url.get("flv_pull_url", {}).get("FULL_HD1")
-                or stream_url.get("flv_pull_url", {}).get("HD1")
-                or stream_url.get("flv_pull_url", {}).get("SD2")
-                or stream_url.get("flv_pull_url", {}).get("SD1")
-                or stream_url.get("rtmp_pull_url", "")
-            )
+            flv_pull_url = stream_url.get("flv_pull_url", {})
+            for key in ("FULL_HD1", "HD1", "SD2", "SD1"):
+                self._add_live_url_candidate(candidates, flv_pull_url.get(key))
+            self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
+            self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
+            return candidates
 
         # Extract stream options
         sdk_data = json.loads(sdk_data_str).get("data", {})
@@ -376,19 +380,38 @@ class TikTokAPI:
         )
         if not qualities:
             logger.warning("No qualities found in the stream data. Returning None.")
-            return None
+            return candidates
         level_map = {q["sdk_key"]: q["level"] for q in qualities}
 
-        best_level = -1
-        best_flv = None
-        for sdk_key, entry in sdk_data.items():
-            level = level_map.get(sdk_key, -1)
+        ordered_sdk_keys = sorted(
+            sdk_data.keys(), key=lambda key: level_map.get(key, -1), reverse=True
+        )
+        for sdk_key in ordered_sdk_keys:
+            entry = sdk_data[sdk_key]
             stream_main = entry.get("main", {})
-            if level > best_level:
-                best_level = level
-                best_flv = stream_main.get("flv")
+            self._add_live_url_candidate(candidates, stream_main.get("flv"))
+            self._add_live_url_candidate(
+                candidates, stream_main.get("hls") or stream_main.get("m3u8")
+            )
 
-        return best_flv
+        flv_pull_url = stream_url.get("flv_pull_url", {})
+        for key in ("FULL_HD1", "HD1", "SD2", "SD1"):
+            self._add_live_url_candidate(candidates, flv_pull_url.get(key))
+        self._add_live_url_candidate(candidates, stream_url.get("hls_pull_url"))
+        self._add_live_url_candidate(candidates, stream_url.get("rtmp_pull_url"))
+
+        return candidates
+
+    def get_live_url(self, room_id: str, user: str = None) -> str | None:
+        """Return the first candidate CDN URL for the streaming."""
+        live_urls = self.get_live_urls(room_id, user=user)
+        if live_urls:
+            return live_urls[0]
+        return None
+
+    def get_live_url_candidates(self, room_id: str, user: str = None) -> list[str]:
+        """Return candidate CDN URLs for the streaming."""
+        return self.get_live_urls(room_id, user=user)
 
     def download_live_stream(self, live_url: str):
         """Generator that returns the live stream for a given room_id."""

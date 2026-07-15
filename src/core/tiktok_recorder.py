@@ -188,66 +188,90 @@ class TikTokRecorder:
         """
         Start recording live
         """
-        live_url = self.tiktok.get_live_url(room_id, user=user)
-        if not live_url:
+        live_urls = self.tiktok.get_live_url_candidates(room_id, user=user)
+        if not live_urls:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         output = self._build_output_path(user)
 
-        if self.duration:
-            logger.info(f"Started recording for {self.duration} seconds ")
-        else:
-            logger.info("Started recording...")
+        min_stream_bytes = 4096
+        for index, live_url in enumerate(live_urls, start=1):
+            if self.duration:
+                logger.info(
+                    f"Started recording for {self.duration} seconds "
+                    f"(stream {index}/{len(live_urls)})"
+                )
+            else:
+                logger.info(f"Started recording (stream {index}/{len(live_urls)})...")
 
-        buffer_size = 512 * 1024  # 512 KB buffer
-        buffer = bytearray()
+            buffer_size = 512 * 1024  # 512 KB buffer
+            buffer = bytearray()
+            bytes_written = 0
 
-        logger.info("[PRESS CTRL + C ONCE TO STOP]")
-        with open(output, "wb") as out_file:
-            stop_recording = False
-            while not stop_recording:
-                try:
-                    if not self.tiktok.is_room_alive(room_id):
-                        logger.info("User is no longer live. Stopping recording.")
-                        break
-
-                    start_time = time.time()
-                    for chunk in self.tiktok.download_live_stream(live_url):
-                        buffer.extend(chunk)
-                        if len(buffer) >= buffer_size:
-                            out_file.write(buffer)
-                            buffer.clear()
-
-                        elapsed_time = time.time() - start_time
-                        if self.duration and elapsed_time >= self.duration:
-                            stop_recording = True
+            logger.info("[PRESS CTRL + C ONCE TO STOP]")
+            with open(output, "wb") as out_file:
+                stop_recording = False
+                stream_ended = False
+                while not stop_recording:
+                    try:
+                        if not self.tiktok.is_room_alive(room_id):
+                            logger.info("User is no longer live. Stopping recording.")
                             break
 
-                except ConnectionError:
-                    if self.mode == Mode.AUTOMATIC:
-                        logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                        time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                        start_time = time.time()
+                        for chunk in self.tiktok.download_live_stream(live_url):
+                            buffer.extend(chunk)
+                            bytes_written += len(chunk)
+                            if len(buffer) >= buffer_size:
+                                out_file.write(buffer)
+                                buffer.clear()
 
-                except (RequestException, HTTPException) as ex:
-                    logger.warning(f"Network hiccup, retrying: {ex}")
-                    time.sleep(2)
+                            elapsed_time = time.time() - start_time
+                            if self.duration and elapsed_time >= self.duration:
+                                stop_recording = True
+                                break
+                        else:
+                            stream_ended = True
 
-                except KeyboardInterrupt:
-                    logger.info("Recording stopped by user.")
-                    stop_recording = True
+                        if stream_ended and bytes_written < min_stream_bytes:
+                            break
 
-                except Exception as ex:
-                    logger.error(
-                        f"Unexpected error during recording: {ex}",
-                        exc_info=True,
-                    )
-                    stop_recording = True
+                    except ConnectionError:
+                        if self.mode == Mode.AUTOMATIC:
+                            logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
+                            time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
-                finally:
-                    if buffer:
-                        out_file.write(buffer)
-                        buffer.clear()
-                    out_file.flush()
+                    except (RequestException, HTTPException) as ex:
+                        logger.warning(f"Network hiccup, retrying: {ex}")
+                        time.sleep(2)
+
+                    except KeyboardInterrupt:
+                        logger.info("Recording stopped by user.")
+                        stop_recording = True
+
+                    except Exception as ex:
+                        logger.error(
+                            f"Unexpected error during recording: {ex}",
+                            exc_info=True,
+                        )
+                        stop_recording = True
+
+                    finally:
+                        if buffer:
+                            out_file.write(buffer)
+                            buffer.clear()
+                        out_file.flush()
+
+            if bytes_written >= min_stream_bytes:
+                break
+
+            logger.warning(
+                f"Stream {index}/{len(live_urls)} returned only {bytes_written} bytes. "
+                "Trying another CDN/quality..."
+            )
+        else:
+            Path(output).unlink(missing_ok=True)
+            raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
         VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
