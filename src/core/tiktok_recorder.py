@@ -1,9 +1,9 @@
 import time
 from http.client import HTTPException
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 
-from requests import RequestException
+from requests import HTTPError, RequestException
 
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
@@ -29,6 +29,11 @@ class TikTokRecorder:
         self.use_telegram = config.use_telegram
         self._proxy = config.proxy
         self._cookies = config.cookies
+
+        # Cooperative shutdown signal for recordings running in worker
+        # threads (followers mode): KeyboardInterrupt only reaches the
+        # main thread, so workers poll this event instead.
+        self._stop_event = Event()
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -141,7 +146,6 @@ class TikTokRecorder:
                         thread = Thread(
                             target=self.start_recording,
                             args=(follower, room_id),
-                            daemon=True,
                         )
                         thread.start()
                         active_recordings[follower] = thread
@@ -176,6 +180,30 @@ class TikTokRecorder:
                 logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
+            except KeyboardInterrupt:
+                self._shutdown_recordings(active_recordings)
+                raise
+
+    def _shutdown_recordings(self, active_recordings: dict) -> None:
+        """
+        Signal worker threads to stop and wait for them to finalize
+        (flush + convert) their recordings.
+        """
+        self._stop_event.set()
+
+        alive = {u: t for u, t in active_recordings.items() if t.is_alive()}
+        if not alive:
+            return
+
+        logger.info(f"Stopping {len(alive)} active recording(s), please wait...")
+        for follower, thread in alive.items():
+            thread.join(timeout=30)
+            if thread.is_alive():
+                logger.warning(
+                    f"Recording of @{follower} did not stop in time; "
+                    "its file may be left unconverted."
+                )
+
     def _build_output_path(self, user: str) -> str:
         filename = (
             f"TK_{user}_{time.strftime('%Y.%m.%d_%H-%M-%S', time.localtime())}_flv.mp4"
@@ -195,6 +223,7 @@ class TikTokRecorder:
         output = self._build_output_path(user)
 
         min_stream_bytes = 4096
+        interrupted = False
         for index, live_url in enumerate(live_urls, start=1):
             if self.duration:
                 logger.info(
@@ -214,6 +243,10 @@ class TikTokRecorder:
                 stream_ended = False
                 while not stop_recording:
                     try:
+                        if self._stop_event.is_set():
+                            stop_recording = True
+                            break
+
                         if not self.tiktok.is_room_alive(room_id):
                             logger.info("User is no longer live. Stopping recording.")
                             break
@@ -230,6 +263,10 @@ class TikTokRecorder:
                             if self.duration and elapsed_time >= self.duration:
                                 stop_recording = True
                                 break
+
+                            if self._stop_event.is_set():
+                                stop_recording = True
+                                break
                         else:
                             stream_ended = True
 
@@ -240,6 +277,26 @@ class TikTokRecorder:
                         if self.mode == Mode.AUTOMATIC:
                             logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                             time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                        else:
+                            logger.warning("Connection lost, retrying...")
+                            time.sleep(2)
+
+                    except HTTPError as ex:
+                        # A 4xx means this CDN URL is stale/dead (e.g. a
+                        # page-scraped fallback URL that has expired). Stop
+                        # retrying it and move on to the next candidate; if
+                        # none work we raise LiveNotFound and recheck later.
+                        status = getattr(
+                            getattr(ex, "response", None), "status_code", None
+                        )
+                        if status is not None and 400 <= status < 500:
+                            logger.warning(
+                                f"Stream URL is no longer valid (HTTP {status}); "
+                                "trying another CDN/quality..."
+                            )
+                            break
+                        logger.warning(f"Network hiccup, retrying: {ex}")
+                        time.sleep(2)
 
                     except (RequestException, HTTPException) as ex:
                         logger.warning(f"Network hiccup, retrying: {ex}")
@@ -248,6 +305,7 @@ class TikTokRecorder:
                     except KeyboardInterrupt:
                         logger.info("Recording stopped by user.")
                         stop_recording = True
+                        interrupted = True
 
                     except Exception as ex:
                         logger.error(
@@ -265,6 +323,16 @@ class TikTokRecorder:
             if bytes_written >= min_stream_bytes:
                 break
 
+            if interrupted:
+                Path(output).unlink(missing_ok=True)
+                raise KeyboardInterrupt()
+
+            if self._stop_event.is_set():
+                # Cooperative stop in a worker thread with too little data
+                # to keep: discard and exit without trying other CDNs.
+                Path(output).unlink(missing_ok=True)
+                return
+
             logger.warning(
                 f"Stream {index}/{len(live_urls)} returned only {bytes_written} bytes. "
                 "Trying another CDN/quality..."
@@ -274,7 +342,18 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
-        VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
+        converted = VideoManagement.convert_flv_to_mp4(
+            output, self.bitrate, self.ffmpeg_path
+        )
+
+        # skip the upload on Ctrl+C so the program exits promptly
+        if self.use_telegram and converted and not interrupted:
+            from upload.telegram import Telegram
+
+            Telegram().upload(converted)
+
+        if interrupted:
+            raise KeyboardInterrupt()
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()

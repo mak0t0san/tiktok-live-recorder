@@ -17,7 +17,7 @@ def read_cookies():
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "..", "cookies.json")
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -27,8 +27,25 @@ def read_telegram_config():
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "..", "telegram.json")
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def read_users_file(path):
+    """
+    Reads TikTok usernames from a text file, one per line.
+    Blank lines and '#' comments (whole-line or trailing) are ignored.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    users = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        users.append(line.removeprefix("@"))
+    return users
 
 
 def is_termux() -> bool:

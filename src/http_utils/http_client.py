@@ -4,6 +4,16 @@ from utils.enums import StatusCode
 from utils.logger_manager import logger
 from utils.utils import is_termux
 
+DEFAULT_TIMEOUT = 30
+
+
+class TimeoutSession(requests.Session):
+    """requests.Session with a default timeout on every request."""
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+        return super().request(*args, **kwargs)
+
 
 class HttpClient:
     def __init__(self, proxy=None, cookies=None):
@@ -32,7 +42,7 @@ class HttpClient:
         self.configure_session()
 
     def configure_session(self) -> None:
-        self.req_stream = requests.Session()
+        self.req_stream = TimeoutSession()
 
         if is_termux():
             self.req = self.req_stream
@@ -42,6 +52,7 @@ class HttpClient:
             self.req = Session(
                 impersonate="chrome136",
                 http_version="v1",
+                timeout=DEFAULT_TIMEOUT,
                 curl_options={CurlOpt.SSLVERSION: CurlSslVersion.TLSv1_2},
             )
 
@@ -61,8 +72,24 @@ class HttpClient:
         logger.info(f"Testing {self.proxy}...")
         proxies = {"http": self.proxy, "https": self.proxy}
 
-        response = requests.get("https://ifconfig.me/ip", proxies=proxies, timeout=10)
+        try:
+            response = requests.get(
+                "https://ifconfig.me/ip", proxies=proxies, timeout=10
+            )
+            if response.status_code == StatusCode.OK:
+                logger.info("Proxy set up successfully")
+            else:
+                logger.warning(
+                    f"Proxy check returned HTTP {response.status_code}. "
+                    "Using the proxy anyway."
+                )
+        except requests.RequestException as e:
+            logger.warning(f"Proxy check failed ({e}). Using the proxy anyway.")
 
-        if response.status_code == StatusCode.OK:
-            self.req.proxies.update(proxies)
-            logger.info("Proxy set up successfully")
+        self.req.proxies.update(proxies)
+        self.req_stream.proxies.update(proxies)
+
+    def close(self) -> None:
+        self.req_stream.close()
+        if self.req is not self.req_stream and self.req is not None:
+            self.req.close()

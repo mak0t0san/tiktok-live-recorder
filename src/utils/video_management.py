@@ -23,9 +23,22 @@ class VideoManagement:
         return False
 
     @staticmethod
+    def _build_output_file(file: str) -> str:
+        directory, basename = os.path.split(file)
+        if basename.endswith("_flv.mp4"):
+            basename = basename.removesuffix("_flv.mp4") + ".mp4"
+        else:
+            stem, ext = os.path.splitext(basename)
+            basename = f"{stem}_converted.mp4"
+        return os.path.join(directory, basename)
+
+    @staticmethod
     def convert_flv_to_mp4(file, bitrate=None, ffmpeg_path=None):
         """
-        Convert the video from flv format to mp4 format
+        Convert the video from flv format to mp4 format.
+
+        Returns the converted file path, or None if conversion was skipped
+        or failed.
         """
         logger.info("Converting {} to MP4 format...".format(file))
 
@@ -33,14 +46,18 @@ class VideoManagement:
             logger.error(
                 f"File {file} is still locked after waiting. Skipping conversion."
             )
-            return
+            return None
+
+        output_file = VideoManagement._build_output_file(file)
+        if os.path.abspath(output_file) == os.path.abspath(file):
+            logger.error(f"Refusing to convert {file}: output path equals input path.")
+            return None
 
         try:
             output_args = {
                 "c": "copy",
                 "y": "-y",
             }
-            output_file = file.replace("_flv.mp4", ".mp4")
 
             if bitrate:
                 output_args["b:v"] = bitrate
@@ -56,7 +73,8 @@ class VideoManagement:
             logger.error(
                 f"ffmpeg conversion failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}"
             )
-            return
+            return None
 
         os.remove(file)
         logger.info(f"Finished converting {Path(output_file).resolve()}\n")
+        return output_file

@@ -185,6 +185,105 @@ def test_invalid_url(monkeypatch):
         validate_and_parse_args()
 
 
+def test_users_file_valid_with_automatic_mode(monkeypatch, tmp_path):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("test\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-mode", "automatic", "-users-file", str(users_file)],
+    )
+    args, mode = validate_and_parse_args()
+    assert args.users_file == str(users_file)
+    assert mode == Mode.AUTOMATIC
+
+
+def test_users_file_requires_automatic_mode(monkeypatch, tmp_path):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("test\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-mode", "manual", "-users-file", str(users_file)],
+    )
+    with pytest.raises(
+        ArgsParseError,
+        match="-users-file is only supported with -mode automatic.",
+    ):
+        validate_and_parse_args()
+
+
+def test_users_file_cannot_be_combined_with_user(monkeypatch, tmp_path):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("test\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "tiktok-live-recorder",
+            "-mode",
+            "automatic",
+            "-user",
+            "test",
+            "-users-file",
+            str(users_file),
+        ],
+    )
+    with pytest.raises(
+        ArgsParseError,
+        match="-users-file cannot be combined with -user, -room_id, or -url.",
+    ):
+        validate_and_parse_args()
+
+
+def test_users_file_must_exist(monkeypatch, tmp_path):
+    missing_file = tmp_path / "does-not-exist.txt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "tiktok-live-recorder",
+            "-mode",
+            "automatic",
+            "-users-file",
+            str(missing_file),
+        ],
+    )
+    with pytest.raises(ArgsParseError, match="Users file not found"):
+        validate_and_parse_args()
+
+
+def test_duration_zero_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-user", "test", "-duration", "0"],
+    )
+    with pytest.raises(ArgsParseError, match="Incorrect duration value"):
+        validate_and_parse_args()
+
+
+def test_duration_negative_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-user", "test", "-duration", "-5"],
+    )
+    with pytest.raises(ArgsParseError, match="Incorrect duration value"):
+        validate_and_parse_args()
+
+
+def test_output_directory_is_created(monkeypatch, tmp_path):
+    output_dir = tmp_path / "new" / "nested"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-user", "test", "-output", str(output_dir)],
+    )
+    args, _ = validate_and_parse_args()
+    assert output_dir.is_dir()
+
+
 def test_automatic_interval_less_than_one(monkeypatch):
     monkeypatch.setattr(
         sys,

@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import threading
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -35,6 +37,21 @@ class Telegram:
                 await self.client.connect()
 
                 if not await self.client.is_user_authorized():
+                    # client.start() prompts for phone/code on stdin, which
+                    # hangs forever in a worker thread or headless run —
+                    # only allow it where the prompt can actually be answered
+                    interactive = (
+                        threading.current_thread() is threading.main_thread()
+                        and sys.stdin is not None
+                        and sys.stdin.isatty()
+                    )
+                    if not interactive:
+                        logger.error(
+                            "Telegram session is not authorized. Run a manual "
+                            "recording with -telegram once from a terminal to "
+                            "log in; skipping this upload."
+                        )
+                        return
                     await self.client.start()
 
                 me = await self.client.get_me()

@@ -1,5 +1,6 @@
 import subprocess
 import platform
+import sys
 from subprocess import SubprocessError
 
 from .logger_manager import logger
@@ -50,7 +51,7 @@ def install_ffmpeg_binary():
     except Exception as e:
         logger.error(f"Error: {e}")
 
-    exit(1)
+    sys.exit(1)
 
 
 def check_distro_library():
@@ -144,7 +145,7 @@ def install_requirements():
         logger.info("Requirements installed successfully\n")
     except SubprocessError as e:
         logger.error(f"Error: {e}")
-        exit(1)
+        sys.exit(1)
 
 
 def check_and_install_dependencies():

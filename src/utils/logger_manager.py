@@ -41,9 +41,9 @@ class LoggerManager:
             info_handler.addFilter(MaxLevelFilter(logging.INFO))
             self.logger.addHandler(info_handler)
 
-            # 2) Console ERROR handler (stderr)
+            # 2) Console WARNING+ handler (stderr)
             error_handler = logging.StreamHandler()
-            error_handler.setLevel(logging.ERROR)
+            error_handler.setLevel(logging.WARNING)
             error_handler.setFormatter(
                 logging.Formatter("[!] %(asctime)s - %(message)s", fmt_datefmt)
             )
@@ -51,11 +51,14 @@ class LoggerManager:
 
             # 3) File handler — DEBUG level, includes full stack traces
             #    Rotates at 5 MB, keeps 3 backups
+            #    NOTE: rotation is not multiprocess-safe; delay=True at least
+            #    avoids child processes opening the file before they log to it
             file_handler = RotatingFileHandler(
                 "tiktok-recorder.log",
                 maxBytes=5 * 1024 * 1024,
                 backupCount=3,
                 encoding="utf-8",
+                delay=True,
             )
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(

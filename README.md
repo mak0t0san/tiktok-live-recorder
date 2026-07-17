@@ -115,6 +115,7 @@ uv run python src/main.py [options]
 | `-user <USERNAME>` | Username(s) to record. Separate multiple with commas. |
 | `-url <URL>` | TikTok live URL to record from. |
 | `-room_id <ROOM_ID>` | Room ID to record from. |
+| `-users-file <PATH>` | Path to a text file listing usernames to monitor in automatic mode, one per line (`#` starts a comment). Re-read periodically, so usernames can be added or removed while running; removing one stops its recording. Cannot be combined with `-user`, `-room_id`, or `-url`. |
 | `-mode <MODE>` | Recording mode: `manual`, `automatic`, `followers`. |
 | `-automatic_interval <MIN>` | Polling interval in minutes (automatic mode only). |
 | `-output <DIRECTORY>` | Directory where recordings will be saved. |

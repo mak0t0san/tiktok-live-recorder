@@ -21,8 +21,26 @@ class TikTokAPI:
         self.EULER_API = "https://tiktok.eulerstream.com"
         self.TIKREC_API = "https://tikrec.com"
 
-        self.http_client = HttpClient(proxy, cookies).req
-        self._http_client_stream = HttpClient(proxy, cookies).req_stream
+        self._http = HttpClient(proxy, cookies)
+        self.http_client = self._http.req
+        self._http_client_stream = self._http.req_stream
+
+    def close(self):
+        self._http.close()
+
+    @staticmethod
+    def _get_json(response) -> dict:
+        """
+        Parse a JSON response, raising a TikTokRecorderError with a snippet
+        of the body when TikTok returns HTML (WAF page, error page) instead.
+        """
+        try:
+            return response.json()
+        except ValueError as e:
+            snippet = (response.text or "")[:150]
+            raise TikTokRecorderError(
+                f"TikTok returned a non-JSON response: {snippet!r}"
+            ) from e
 
     def _is_authenticated(self) -> bool:
         response = self.http_client.get(f"{self.BASE_URL}/foryou")
@@ -46,10 +64,12 @@ class TikTokAPI:
         if not room_id:
             raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
 
-        alive_data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/check_alive/"
-            f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
-        ).json()
+        alive_data = self._get_json(
+            self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/check_alive/"
+                f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
+            )
+        )
 
         data_list = alive_data.get("data")
         if (
@@ -60,9 +80,11 @@ class TikTokAPI:
         ):
             return False
 
-        room_info = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-        ).json()
+        room_info = self._get_json(
+            self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            )
+        )
 
         status_code = room_info.get("status_code", 0)
         if status_code == 4003110:
@@ -107,14 +129,16 @@ class TikTokAPI:
         """
         Given a room_id, I get the username
         """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-        ).json()
+        data = self._get_json(
+            self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            )
+        )
 
         if "Follow the creator to watch their LIVE" in json.dumps(data):
             raise UserLiveError(TikTokError.ACCOUNT_PRIVATE_FOLLOW)
 
-        if "This account is private" in data:
+        if "This account is private" in json.dumps(data):
             raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)
 
         display_id = data.get("data", {}).get("owner", {}).get("display_id")
@@ -133,6 +157,7 @@ class TikTokAPI:
         if response.status_code == StatusCode.REDIRECT:
             raise UserLiveError(TikTokError.COUNTRY_BLACKLISTED)
 
+        user = None
         if response.status_code == StatusCode.MOVED:  # MOBILE URL
             matches = re.findall("com/@(.*?)/live", content)
             if len(matches) < 1:
@@ -144,6 +169,9 @@ class TikTokAPI:
         match = re.match(r"https?://(?:www\.)?tiktok\.com/@([^/]+)/live", live_url)
         if match:
             user = match.group(1)
+
+        if user is None:
+            raise LiveNotFound(TikTokError.INVALID_TIKTOK_LIVE_URL)
 
         room_id = self.get_room_id_from_user(user)
 
@@ -215,7 +243,7 @@ class TikTokAPI:
         if not content or "Please wait" in content:
             raise UserLiveError(TikTokError.WAF_BLOCKED)
 
-        data = response.json()
+        data = self._get_json(response)
         return (data.get("data") or {}).get("user", {}).get("roomId")
 
     def get_followers_list(self, sec_uid) -> list:
@@ -266,7 +294,7 @@ class TikTokAPI:
             if not response.content:
                 raise TikTokRecorderError("Empty response from TikTok followers API.")
 
-            data = response.json()
+            data = self._get_json(response)
             user_list = data.get("userList", [])
 
             for user in user_list:
@@ -326,11 +354,13 @@ class TikTokAPI:
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
         """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-        ).json()
+        data = self._get_json(
+            self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            )
+        )
 
-        if "This account is private" in data:
+        if "This account is private" in json.dumps(data):
             raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)
 
         status_code = data.get("status_code", 0)
@@ -416,6 +446,12 @@ class TikTokAPI:
     def download_live_stream(self, live_url: str):
         """Generator that returns the live stream for a given room_id."""
         stream = self._http_client_stream.get(live_url, stream=True)
-        for chunk in stream.iter_content(chunk_size=4096):
-            if chunk:
-                yield chunk
+        try:
+            stream.raise_for_status()
+            for chunk in stream.iter_content(chunk_size=4096):
+                if chunk:
+                    yield chunk
+        finally:
+            # also runs on GeneratorExit when the consumer abandons the
+            # generator, so the connection is always released
+            stream.close()

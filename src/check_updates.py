@@ -58,6 +58,19 @@ def _merge_cookies(existing_path: Path, new_path: Path) -> None:
         f.write("\n")
 
 
+def parse_version(v) -> tuple:
+    """
+    Parse a version string like "7.7.1" into a comparable tuple of ints.
+
+    Returns (0,) for malformed input so a broken remote version never
+    triggers a spurious update.
+    """
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (0,)
+
+
 def check_file(path: str) -> bool:
     """
     Check if a file exists at the given path.
@@ -111,13 +124,7 @@ def check_updates() -> bool:
         delete_tmp_file()
         return False
 
-    def _parse_version(v):
-        try:
-            return (float(str(v)),)
-        except ValueError:
-            return tuple(int(x) for x in str(v).split("."))
-
-    if _parse_version(Info.VERSION) != _parse_version(InfoOld.VERSION):
+    if parse_version(Info.VERSION) > parse_version(InfoOld.VERSION):
         print(
             f"Current version: {InfoOld.__str__(InfoOld.VERSION)}\nNew version available: {Info.__str__(Info.VERSION)}"
         )

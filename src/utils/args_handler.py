@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 
 from utils.custom_exceptions import ArgsParseError
@@ -32,6 +33,21 @@ def parse_args():
         "-room_id",
         dest="room_id",
         help="Record a live session from the TikTok room ID.",
+        action="store",
+    )
+
+    parser.add_argument(
+        "-users-file",
+        dest="users_file",
+        help=(
+            "Path to a text file listing TikTok usernames to monitor in automatic "
+            "mode, one per line ('#' starts a comment).\n"
+            "The file is re-read periodically, so usernames can be added or "
+            "removed while the program is running without restarting it.\n"
+            "Removing a username stops its monitoring process, terminating any "
+            "in-progress recording without conversion.\n"
+            "Cannot be combined with -user, -room_id, or -url."
+        ),
         action="store",
     )
 
@@ -133,14 +149,26 @@ def validate_and_parse_args():
             "Incorrect mode value. Choose between 'manual', 'automatic' or 'followers'."
         )
 
+    if args.users_file:
+        if args.mode != "automatic":
+            raise ArgsParseError("-users-file is only supported with -mode automatic.")
+        if args.user or args.room_id or args.url:
+            raise ArgsParseError(
+                "-users-file cannot be combined with -user, -room_id, or -url."
+            )
+        if not os.path.isfile(args.users_file):
+            raise ArgsParseError(f"Users file not found: {args.users_file}")
+
     if args.mode in ["manual", "automatic"]:
-        if not args.user and not args.room_id and not args.url:
+        if not args.user and not args.room_id and not args.url and not args.users_file:
             raise ArgsParseError(
                 "Missing URL, username, or room ID. Please provide one of these parameters."
             )
 
     if args.user:
-        args.user = [u.lstrip("@").strip() for u in args.user.split(",") if u.strip()]
+        args.user = [
+            u.strip().removeprefix("@") for u in args.user.split(",") if u.strip()
+        ]
 
     if args.user and len(args.user) > 1 and (args.room_id or args.url):
         raise ArgsParseError(
@@ -159,21 +187,22 @@ def validate_and_parse_args():
     ):
         raise ArgsParseError("Please provide only one among username, room ID, or URL.")
 
-    # Edit: now arg.user is a list
     if args.user and len(args.user) == 1:
         args.user = args.user[0]
-
-    if (
-        (isinstance(args.user, str) and args.user and args.room_id)
-        or (isinstance(args.user, str) and args.user and args.url)
-        or (args.room_id and args.url)
-    ):
-        raise ArgsParseError("Please provide only one among username, room ID, or URL.")
 
     if args.automatic_interval < 1:
         raise ArgsParseError(
             "Incorrect automatic_interval value. Must be one minute or more."
         )
+
+    if args.duration is not None and args.duration <= 0:
+        raise ArgsParseError("Incorrect duration value. Must be a positive number.")
+
+    if args.output:
+        try:
+            os.makedirs(args.output, exist_ok=True)
+        except OSError as e:
+            raise ArgsParseError(f"Cannot create output directory: {e}")
 
     if args.mode == "manual":
         mode = Mode.MANUAL
