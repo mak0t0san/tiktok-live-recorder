@@ -5,135 +5,48 @@ import multiprocessing
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def record_user(config):
-    from core.tiktok_recorder import TikTokRecorder
-    from utils.logger_manager import logger
-
-    try:
-        TikTokRecorder(config).run()
-    except Exception as e:
-        logger.error(f"{e}", exc_info=True)
-
-
-def _build_config(args, mode, cookies, user=None):
-    from utils.recorder_config import RecorderConfig
-
-    return RecorderConfig(
-        url=args.url,
-        user=user,
-        room_id=args.room_id,
-        mode=mode,
-        automatic_interval=args.automatic_interval,
-        cookies=cookies,
-        proxy=args.proxy,
-        output=args.output,
-        duration=args.duration,
-        use_telegram=args.telegram,
-        bitrate=args.bitrate,
-        ffmpeg_path=args.ffmpeg_path,
-    )
-
-
 def run_recordings_from_file(args, mode, cookies):
-    import time
-    from utils.utils import read_users_file
-    from utils.enums import TimeOut
+    from core.supervisor import Supervisor, install_shutdown_handlers, terminate_all
     from utils.logger_manager import logger
 
-    processes = {}  # user -> Process
-    restart_state = {}  # user -> {"count", "next_allowed", "started"}
-
-    restart_base = TimeOut.USERS_FILE_POLL  # seconds
-    restart_cap = 600  # max backoff between restarts of a failing user
-    stable_after = 300  # reset the backoff once a process survives this long
-
-    def start_user(user):
-        config = _build_config(args, mode, cookies, user=user)
-        p = multiprocessing.Process(target=record_user, args=(config,))
-        p.start()
-        processes[user] = p
-        state = restart_state.setdefault(
-            user, {"count": 0, "next_allowed": 0.0, "started": 0.0}
-        )
-        state["started"] = time.time()
-
-    def sync_users():
-        try:
-            users = read_users_file(args.users_file)
-        except OSError as e:
-            logger.error(f"Failed to read users file: {e}")
-            return
-
-        now = time.time()
-
-        # stop monitoring users removed from the file
-        for user in set(processes) - set(users):
-            p = processes.pop(user)
-            restart_state.pop(user, None)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=5)
-            logger.info(f"Stopped monitoring @{user} (removed from users file)")
-
-        for user in users:
-            proc = processes.get(user)
-            if proc is None:
-                start_user(user)
-                logger.info(f"Started monitoring @{user}")
-                continue
-
-            if proc.is_alive():
-                continue
-
-            # dead process: restart with exponential backoff so a failing
-            # user doesn't respawn endlessly every poll
-            state = restart_state.setdefault(
-                user, {"count": 0, "next_allowed": 0.0, "started": 0.0}
-            )
-            if state["started"] and now - state["started"] >= stable_after:
-                state["count"] = 0
-
-            if now < state["next_allowed"]:
-                continue
-
-            state["count"] += 1
-            state["next_allowed"] = now + min(
-                restart_base * 2 ** state["count"], restart_cap
-            )
-            start_user(user)
-            logger.info(f"Restarted monitoring @{user}")
-
-    sync_users()
-    if not processes:
+    supervisor = Supervisor(args, mode, cookies)
+    supervisor.sync_users()
+    if not supervisor.processes:
         logger.error("No users found in the users file to monitor.")
         return
 
+    install_shutdown_handlers(supervisor.processes)
+
     try:
-        while True:
-            time.sleep(TimeOut.USERS_FILE_POLL)
-            sync_users()
+        supervisor.run_forever()
     except KeyboardInterrupt:
         print("\n[!] Ctrl-C detected.")
         try:
-            for p in processes.values():
+            for p in supervisor.processes.values():
                 p.join()
         except KeyboardInterrupt:
             print("\n[!] Forcefully terminating all processes.")
-            for p in processes.values():
-                if p.is_alive():
-                    p.terminate()
+            terminate_all(supervisor.processes)
 
 
 def run_recordings(args, mode, cookies):
+    from core.supervisor import (
+        build_config,
+        install_shutdown_handlers,
+        record_user,
+        terminate_all,
+    )
+
     if args.users_file:
         run_recordings_from_file(args, mode, cookies)
     elif isinstance(args.user, list):
         processes = []
         for user in args.user:
-            config = _build_config(args, mode, cookies, user=user)
+            config = build_config(args, mode, cookies, user=user)
             p = multiprocessing.Process(target=record_user, args=(config,))
             p.start()
             processes.append(p)
+        install_shutdown_handlers(processes)
         try:
             for p in processes:
                 p.join()
@@ -144,11 +57,9 @@ def run_recordings(args, mode, cookies):
                     p.join()
             except KeyboardInterrupt:
                 print("\n[!] Forcefully terminating all processes.")
-                for p in processes:
-                    if p.is_alive():
-                        p.terminate()
+                terminate_all(processes)
     else:
-        config = _build_config(args, mode, cookies, user=args.user)
+        config = build_config(args, mode, cookies, user=args.user)
         record_user(config)
 
 
@@ -178,8 +89,29 @@ def main():
         # read cookies from the config file
         cookies = read_cookies()
 
-        # run the recordings based on the parsed arguments
-        run_recordings(args, mode, cookies)
+        # warn (don't block) if another instance is already running: the real
+        # duplicate-recording guard is the per-user lock, but running multiple
+        # whole instances is a common way to end up with duplicate recordings
+        import atexit
+        from pathlib import Path
+        from utils.recording_lock import FileLock
+
+        instance_lock = FileLock(Path.cwd() / ".tiktok-recorder.lock")
+        if not instance_lock.acquire():
+            logger.warning(
+                "Another TikTok Live Recorder instance appears to be running. "
+                "Running multiple instances can produce duplicate recordings."
+            )
+        else:
+            atexit.register(instance_lock.release)
+
+        # run the web dashboard or the recordings based on the parsed arguments
+        if getattr(args, "web", False):
+            from web.server import run_web
+
+            run_web(args, mode, cookies)
+        else:
+            run_recordings(args, mode, cookies)
 
     except TikTokRecorderError as ex:
         logger.error(f"Application Error: {ex}")

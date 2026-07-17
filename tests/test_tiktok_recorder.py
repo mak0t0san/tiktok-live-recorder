@@ -199,6 +199,38 @@ def test_stop_event_finalizes_recording_without_raising(tmp_path, monkeypatch):
     assert converted, "cooperative stop should still convert the recording"
 
 
+def test_start_recording_skips_when_user_already_locked(tmp_path, monkeypatch):
+    recorder = TikTokRecorder(
+        RecorderConfig(
+            mode=Mode.MANUAL, user="creator", cookies={}, output=str(tmp_path)
+        )
+    )
+    recorder.tiktok = FakeStreamAPI()
+
+    converted = []
+    monkeypatch.setattr(
+        VideoManagement,
+        "convert_flv_to_mp4",
+        lambda *args, **kwargs: converted.append(args),
+    )
+
+    # Simulate another worker/instance already recording this user.
+    from utils.custom_exceptions import AlreadyRecording
+    from utils.recording_lock import recording_lock
+
+    held = recording_lock("creator", str(tmp_path))
+    assert held.acquire() is True
+    try:
+        with pytest.raises(AlreadyRecording):
+            recorder.start_recording("creator", "1234567890")
+    finally:
+        held.release()
+
+    # No recording started: nothing converted, no _flv.mp4 written.
+    assert converted == []
+    assert not any(p.name.endswith("_flv.mp4") for p in tmp_path.iterdir())
+
+
 def test_stop_event_with_tiny_stream_deletes_output(tmp_path, monkeypatch):
     recorder = _build_recorder(tmp_path)
     recorder.tiktok = FakeStreamAPI()

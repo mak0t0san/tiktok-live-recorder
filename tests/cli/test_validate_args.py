@@ -303,3 +303,37 @@ def test_automatic_interval_less_than_one(monkeypatch):
         match="Incorrect automatic_interval value. Must be one minute or more.",
     ):
         validate_and_parse_args()
+
+
+def test_web_forces_automatic_mode_and_creates_users_file(monkeypatch, tmp_path):
+    users_file = tmp_path / "users.txt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-web", "-users-file", str(users_file)],
+    )
+    args, mode = validate_and_parse_args()
+    assert mode == Mode.AUTOMATIC
+    assert users_file.is_file()
+    assert args.web_host == "0.0.0.0"
+    assert args.web_port == 8000
+
+
+def test_web_rejects_explicit_user(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-web", "-user", "test"],
+    )
+    with pytest.raises(ArgsParseError, match="-web cannot be combined"):
+        validate_and_parse_args()
+
+
+def test_web_rejects_followers_mode(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tiktok-live-recorder", "-web", "-mode", "followers"],
+    )
+    with pytest.raises(ArgsParseError, match="-web only supports automatic mode"):
+        validate_and_parse_args()

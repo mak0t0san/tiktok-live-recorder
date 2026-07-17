@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TikTok Live Recorder — Login</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    display: grid; place-items: center; min-height: 100vh; margin: 0;
+    background: #101014; color: #eee;
+  }
+  form {
+    background: #1a1a22; padding: 2rem; border-radius: 12px;
+    display: flex; flex-direction: column; gap: .75rem; width: min(320px, 90vw);
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 .5rem; }
+  input, button {
+    font: inherit; padding: .6rem .8rem; border-radius: 8px; border: 1px solid #333;
+  }
+  input { background: #101014; color: inherit; }
+  button { background: #fe2c55; color: #fff; border: 0; cursor: pointer; }
+  #error { color: #ff7b93; font-size: .85rem; min-height: 1.2em; margin: 0; }
+</style>
+</head>
+<body>
+<form id="form">
+  <h1>TikTok Live Recorder</h1>
+  <input type="password" id="password" placeholder="Password" autofocus autocomplete="current-password">
+  <button type="submit">Sign in</button>
+  <p id="error"></p>
+</form>
+<script>
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const resp = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: document.getElementById('password').value }),
+  });
+  if (resp.ok) { location.href = '/'; }
+  else { document.getElementById('error').textContent = 'Wrong password'; }
+});
+</script>
+</body>
+</html>

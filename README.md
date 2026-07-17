@@ -21,6 +21,7 @@ The TikTok Live Recorder is a tool designed to easily capture and save live stre
 
 - [Installation](#installation)
 - [Usage](#command-line-usage)
+- [Web Dashboard](#web-dashboard)
 - [Guide](#guide)
 
 ## Installation
@@ -123,6 +124,10 @@ uv run python src/main.py [options]
 | `-proxy <URL>` | HTTP proxy to bypass regional restrictions. |
 | `-bitrate <BITRATE>` | Output bitrate for post-processing (e.g. `1M`, `1000k`). |
 | `-telegram` | Upload the recording to Telegram when done. Requires `telegram.json`. |
+| `-web` | Start the web dashboard instead of the plain CLI (see [Web Dashboard](#web-dashboard)). |
+| `-web-host <HOST>` | Interface for the web dashboard. Default: `0.0.0.0` (all interfaces). |
+| `-web-port <PORT>` | Port for the web dashboard. Default: `8000`. |
+| `-web-password <PASSWORD>` | Password for the web dashboard (or set `TLR_WEB_PASSWORD`). |
 | `-no-update-check` | Skip the automatic update check on startup. |
 
 ### Recording Modes
@@ -130,6 +135,39 @@ uv run python src/main.py [options]
 - **`manual`** *(default)*: Records immediately if the user is currently live.
 - **`automatic`**: Polls at regular intervals and records whenever the user goes live.
 - **`followers`**: Automatically records live streams from all followed users.
+
+## Web Dashboard
+
+A browser UI for managing recordings, built on the automatic users-file mode:
+
+```bash
+# one-time: install the web extra
+uv sync --extra web
+
+# start the dashboard (creates users.txt if missing)
+TLR_WEB_PASSWORD=changeme uv run python src/main.py -web -output ./recordings
+```
+
+Then open `http://<your-machine>:8000` from any device on your network and log
+in with the password. From the dashboard you can:
+
+- **Add or remove monitored users** — edits the same users file the CLI uses,
+  so the two stay interchangeable.
+- **Watch recordings in progress** — live state, duration, and file size per
+  user, updated every couple of seconds.
+- **Stop individual recordings** — a stop finalizes the file (flush + MP4
+  conversion) instead of killing the recorder mid-write; **Resume** restarts
+  monitoring afterwards.
+- **Preview live streams** — an on-demand HLS player fed from the recording
+  already being written to disk (no extra TikTok connection, no re-encoding).
+  Previews shut down automatically ~30 s after the last viewer leaves.
+- **Browse and download completed recordings.**
+
+Security notes: the dashboard binds to all interfaces by default so you can
+reach it from other devices — anyone on the network who has the password has
+full control, and traffic is plain HTTP. Keep it on a trusted LAN or a VPN
+such as Tailscale; use `-web-host 127.0.0.1` for local-only access. If no
+password is configured, a one-off password is generated and printed at startup.
 
 ## Guide
 

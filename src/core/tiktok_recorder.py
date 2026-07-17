@@ -9,8 +9,15 @@ from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
 from utils.video_management import VideoManagement
-from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
+from utils.custom_exceptions import (
+    LiveNotFound,
+    UserLiveError,
+    TikTokRecorderError,
+    AlreadyRecording,
+)
 from utils.enums import Mode, Error, TimeOut, TikTokError
+from utils.recording_lock import recording_lock
+from utils.status_store import NullStatusReporter, StatusReporter
 
 
 class TikTokRecorder:
@@ -32,8 +39,18 @@ class TikTokRecorder:
 
         # Cooperative shutdown signal for recordings running in worker
         # threads (followers mode): KeyboardInterrupt only reaches the
-        # main thread, so workers poll this event instead.
-        self._stop_event = Event()
+        # main thread, so workers poll this event instead. The parent
+        # process (supervisor/web UI) may inject a multiprocessing.Event
+        # via the config to request the same cooperative stop from outside.
+        self._stop_event = (
+            config.stop_event if config.stop_event is not None else Event()
+        )
+
+        # Best-effort status reporting for the web dashboard; a no-op unless
+        # a status database path was provided (real reporter is attached in
+        # run() once the username is resolved).
+        self._status_db = config.status_db
+        self._status = NullStatusReporter()
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -88,6 +105,10 @@ class TikTokRecorder:
         """
         self._setup()
 
+        if self._status_db and self.user:
+            self._status = StatusReporter(self.user, self._status_db)
+            self._status.report(state="waiting", room_id=self.room_id)
+
         if self.mode == Mode.MANUAL:
             self.manual_mode()
 
@@ -103,22 +124,46 @@ class TikTokRecorder:
 
         self.start_recording(self.user, self.room_id)
 
+    def _wait_or_stop(self, seconds) -> bool:
+        """
+        Idle for up to ``seconds``, waking early if a cooperative stop is
+        requested. Returns True when a stop was requested.
+        """
+        return self._stop_event.wait(seconds)
+
     def automatic_mode(self):
-        while True:
+        while not self._stop_event.is_set():
             try:
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
                 self.manual_mode()
+
+            except AlreadyRecording as ex:
+                logger.info(ex)
+                logger.info(
+                    f"Waiting {self.automatic_interval} minutes before recheck\n"
+                )
+                self._status.report(state="waiting")
+                if self._wait_or_stop(self.automatic_interval * TimeOut.ONE_MINUTE):
+                    break
 
             except (UserLiveError, LiveNotFound) as ex:
                 logger.info(ex)
                 logger.info(
                     f"Waiting {self.automatic_interval} minutes before recheck\n"
                 )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                self._status.report(state="waiting")
+                if self._wait_or_stop(self.automatic_interval * TimeOut.ONE_MINUTE):
+                    break
 
             except (ConnectionError, RequestException, HTTPException):
                 logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                self._status.report(state="waiting")
+                if self._wait_or_stop(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE):
+                    break
+
+        if self._stop_event.is_set():
+            logger.info(f"Stop requested; @{self.user} monitoring ended.")
+            self._status.report(state="stopped")
 
     def followers_mode(self):
         active_recordings = {}  # follower -> Thread
@@ -144,7 +189,7 @@ class TikTokRecorder:
                         logger.info(f"@{follower} is live. Starting recording...")
 
                         thread = Thread(
-                            target=self.start_recording,
+                            target=self._record_follower,
                             args=(follower, room_id),
                         )
                         thread.start()
@@ -184,6 +229,17 @@ class TikTokRecorder:
                 self._shutdown_recordings(active_recordings)
                 raise
 
+    def _record_follower(self, follower, room_id):
+        """
+        Thread target for followers mode: record a follower, swallowing
+        AlreadyRecording (another instance holds the lock) so a lock miss
+        doesn't dump a thread traceback.
+        """
+        try:
+            self.start_recording(follower, room_id)
+        except AlreadyRecording as ex:
+            logger.info(ex)
+
     def _shutdown_recordings(self, active_recordings: dict) -> None:
         """
         Signal worker threads to stop and wait for them to finalize
@@ -214,6 +270,22 @@ class TikTokRecorder:
 
     def start_recording(self, user, room_id):
         """
+        Acquire a per-user lock, then record. The lock prevents a second worker
+        or program instance from recording the same user into a duplicate file.
+        """
+        lock = recording_lock(user, self.output)
+        if not lock.acquire():
+            raise AlreadyRecording(
+                f"@{user} is already being recorded by another "
+                "worker/instance; skipping."
+            )
+        try:
+            self._do_recording(user, room_id)
+        finally:
+            lock.release()
+
+    def _do_recording(self, user, room_id):
+        """
         Start recording live
         """
         live_urls = self.tiktok.get_live_url_candidates(room_id, user=user)
@@ -221,6 +293,13 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         output = self._build_output_path(user)
+        self._status.report(
+            state="recording",
+            room_id=room_id,
+            output_path=output,
+            started_at=time.time(),
+            bytes_written=0,
+        )
 
         min_stream_bytes = 4096
         interrupted = False
@@ -258,6 +337,9 @@ class TikTokRecorder:
                             if len(buffer) >= buffer_size:
                                 out_file.write(buffer)
                                 buffer.clear()
+                                self._status.report(
+                                    state="recording", bytes_written=bytes_written
+                                )
 
                             elapsed_time = time.time() - start_time
                             if self.duration and elapsed_time >= self.duration:
@@ -342,14 +424,18 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
+        self._status.report(state="converting", bytes_written=bytes_written)
         converted = VideoManagement.convert_flv_to_mp4(
             output, self.bitrate, self.ffmpeg_path
         )
+        if converted:
+            self._status.report(state="converting", output_path=str(converted))
 
         # skip the upload on Ctrl+C so the program exits promptly
         if self.use_telegram and converted and not interrupted:
             from upload.telegram import Telegram
 
+            self._status.report(state="uploading")
             Telegram().upload(converted)
 
         if interrupted:

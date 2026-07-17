@@ -18,11 +18,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+web = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.30.0",
+    "itsdangerous>=2.2.0",
+]
 dev = [
     "ruff>=0.12.0",
     "pre-commit>=4.3.0",
     "bump-my-version>=0.32.0",
     "pytest",
+    # web extra + test client, duplicated here so `--extra dev` runs all tests
+    "fastapi>=0.110.0",
+    "uvicorn>=0.30.0",
+    "itsdangerous>=2.2.0",
+    "httpx>=0.27.0",
 ]
 
 [project.urls]

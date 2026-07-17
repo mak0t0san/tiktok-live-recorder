@@ -41,3 +41,9 @@ class TikRecUnavailableError(TikTokRecorderError):
     """Raised when the tikrec signing service is unreachable or returns an unexpected response."""
 
     pass
+
+
+class AlreadyRecording(TikTokRecorderError):
+    """Raised when the user is already being recorded by another worker/instance."""
+
+    pass

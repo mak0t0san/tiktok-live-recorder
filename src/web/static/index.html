@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TikTok Live Recorder</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif; margin: 0;
+    background: #101014; color: #eee;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: .9rem 1.2rem; background: #1a1a22; position: sticky; top: 0;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; }
+  main { max-width: 1100px; margin: 0 auto; padding: 1.2rem; }
+  h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .06em; color: #9aa; }
+  button {
+    font: inherit; border: 0; border-radius: 8px; padding: .45rem .8rem;
+    cursor: pointer; background: #2a2a35; color: #eee;
+  }
+  button.primary { background: #fe2c55; color: #fff; }
+  button.danger { background: #7a2030; }
+  button:disabled { opacity: .45; cursor: default; }
+  #add-form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  #add-user {
+    font: inherit; flex: 1; max-width: 320px; padding: .45rem .7rem;
+    border-radius: 8px; border: 1px solid #333; background: #16161c; color: inherit;
+  }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: .9rem; }
+  .card { background: #1a1a22; border-radius: 12px; padding: .9rem 1rem; }
+  .card .row { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+  .card h3 { margin: 0; font-size: 1rem; overflow-wrap: anywhere; }
+  .chip {
+    font-size: .72rem; padding: .15rem .55rem; border-radius: 999px;
+    background: #2a2a35; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
+  }
+  .chip.recording { background: #7a1030; color: #ffb3c2; }
+  .chip.waiting { background: #23324a; color: #9fc3ff; }
+  .chip.converting, .chip.uploading { background: #4a3a15; color: #ffd98a; }
+  .chip.error, .chip.stale { background: #5a1a1a; color: #ffb3a8; }
+  .chip.stopped { background: #333; color: #bbb; }
+  .meta { font-size: .8rem; color: #9aa; margin: .5rem 0; min-height: 1.2em; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: .45rem; flex-wrap: wrap; margin-top: .4rem; }
+  video { width: 100%; border-radius: 8px; margin-top: .6rem; background: #000; aspect-ratio: 9 / 12; }
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #24242e; overflow-wrap: anywhere; }
+  th { color: #9aa; font-weight: 500; }
+  td.num { white-space: nowrap; }
+  a { color: #8ab4ff; }
+  .table-wrap { overflow-x: auto; }
+  .empty { color: #778; font-size: .88rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎥 TikTok Live Recorder</h1>
+  <button id="logout">Log out</button>
+</header>
+<main>
+  <h2>Monitored users</h2>
+  <form id="add-form">
+    <input id="add-user" placeholder="Add TikTok username (e.g. @someone)" autocomplete="off">
+    <button class="primary" type="submit">Add</button>
+  </form>
+  <div class="cards" id="cards"></div>
+  <p class="empty" id="cards-empty" hidden>No users monitored yet — add one above.</p>
+
+  <h2 style="margin-top:2rem">Completed recordings</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+      <tbody id="files"></tbody>
+    </table>
+  </div>
+  <p class="empty" id="files-empty" hidden>No recordings yet.</p>
+</main>
+<script src="/static/hls.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

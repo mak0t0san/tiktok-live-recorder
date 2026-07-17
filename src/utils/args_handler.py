@@ -123,6 +123,47 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-web",
+        dest="web",
+        action="store_true",
+        help=(
+            "Start the web dashboard instead of the plain CLI.\n"
+            "Monitors the users file (default: users.txt, created if missing) "
+            "and serves a UI to manage users, watch and stop recordings, and "
+            "preview live streams.\n"
+            "Requires the 'web' extra: uv sync --extra web"
+        ),
+    )
+
+    parser.add_argument(
+        "-web-host",
+        dest="web_host",
+        default="0.0.0.0",
+        help="Interface for the web dashboard. [Default: 0.0.0.0 (all interfaces)]",
+        action="store",
+    )
+
+    parser.add_argument(
+        "-web-port",
+        dest="web_port",
+        type=int,
+        default=8000,
+        help="Port for the web dashboard. [Default: 8000]",
+        action="store",
+    )
+
+    parser.add_argument(
+        "-web-password",
+        dest="web_password",
+        default=None,
+        help=(
+            "Password for the web dashboard (or set TLR_WEB_PASSWORD).\n"
+            "A one-off password is generated and logged when unset."
+        ),
+        action="store",
+    )
+
+    parser.add_argument(
         "-no-update-check",
         dest="update_check",
         action="store_false",
@@ -139,6 +180,24 @@ def parse_args():
 
 def validate_and_parse_args():
     args = parse_args()
+
+    if args.web:
+        if args.user or args.room_id or args.url:
+            raise ArgsParseError(
+                "-web cannot be combined with -user, -room_id, or -url; "
+                "manage users from the web UI instead."
+            )
+        if args.mode not in ("manual", "automatic"):
+            raise ArgsParseError("-web only supports automatic mode.")
+        # the dashboard drives the users-file automatic mode
+        args.mode = "automatic"
+        if not args.users_file:
+            args.users_file = "users.txt"
+        try:
+            with open(args.users_file, "a", encoding="utf-8"):
+                pass
+        except OSError as e:
+            raise ArgsParseError(f"Cannot create users file: {e}")
 
     if not args.mode:
         raise ArgsParseError(
