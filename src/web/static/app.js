@@ -39,6 +39,15 @@ function displayState(rec) {
   return rec.state;
 }
 
+function avatarHtml(rec) {
+  if (rec.avatar) {
+    return `<img class="avatar" src="${esc(rec.avatar)}" alt=""
+      onerror="this.hidden=true">`;
+  }
+  const letter = (rec.user || '?')[0].toUpperCase();
+  return `<div class="avatar avatar-fallback">${esc(letter)}</div>`;
+}
+
 function cardHtml(rec, now) {
   const state = displayState(rec);
   const meta = [];
@@ -51,9 +60,15 @@ function cardHtml(rec, now) {
   const resumable = rec.stopped;
   const previewable = rec.previewable && !rec.stopped;
 
+  const name = rec.nickname ? esc(rec.nickname) : `@${esc(rec.user)}`;
+  const handle = rec.nickname ? `<div class="handle">@${esc(rec.user)}</div>` : '';
+
   return `
     <div class="row">
-      <h3>@${esc(rec.user)}</h3>
+      <div class="id">
+        ${avatarHtml(rec)}
+        <div><h3>${name}</h3>${handle}</div>
+      </div>
       <span class="chip ${state}">${state}</span>
     </div>
     <p class="meta">${meta.join(' · ')}</p>
@@ -114,9 +129,22 @@ async function act(user, action, card) {
   refresh();
 }
 
+function renderGlobalControls(data) {
+  const pauseBtn = document.getElementById('pause-toggle');
+  pauseBtn.hidden = false;
+  pauseBtn.textContent = data.paused ? 'Resume monitoring' : 'Pause monitoring';
+  document.getElementById('paused-banner').hidden = !data.paused;
+
+  const anyStoppable = data.recordings.some((r) => r.alive && !r.stopped);
+  const anyResumable = data.recordings.some((r) => r.stopped);
+  document.getElementById('stop-all').hidden = !anyStoppable;
+  document.getElementById('resume-all').hidden = !anyResumable;
+}
+
 async function refresh() {
   const data = await (await api('/api/status')).json();
   const seen = new Set();
+  renderGlobalControls(data);
 
   for (const rec of data.recordings) {
     seen.add(rec.user);
@@ -169,6 +197,96 @@ document.getElementById('add-form').addEventListener('submit', async (e) => {
 document.getElementById('logout').addEventListener('click', async () => {
   await api('/api/logout', { method: 'POST' });
   location.href = '/login';
+});
+
+/* -- global stop / resume / pause ---------------------------------------- */
+
+document.getElementById('stop-all').addEventListener('click', async () => {
+  if (!confirm('Stop all recorders? In-flight recordings are finalized; '
+    + 'each user stays stopped until resumed.')) return;
+  for (const user of [...activePreviews.keys()]) closePreview(user);
+  await api('/api/recordings/stop-all', { method: 'POST' });
+  refresh();
+});
+
+document.getElementById('resume-all').addEventListener('click', async () => {
+  await api('/api/recordings/resume-all', { method: 'POST' });
+  refresh();
+});
+
+document.getElementById('pause-toggle').addEventListener('click', async (e) => {
+  const pausing = e.target.textContent.startsWith('Pause');
+  if (pausing && !confirm('Pause monitoring? In-flight recordings are '
+    + 'finalized and nothing records until you resume.')) return;
+  await api(`/api/monitoring/${pausing ? 'pause' : 'resume'}`, { method: 'POST' });
+  refresh();
+});
+
+/* -- following picker ----------------------------------------------------- */
+
+const followingList = document.getElementById('following-list');
+const followingMsg = document.getElementById('following-msg');
+let followingLoaded = false;
+
+function followRowHtml(entry) {
+  const avatar = entry.avatar_url
+    ? `<img class="avatar" src="${esc(entry.avatar_url)}" alt=""
+        onerror="this.hidden=true">`
+    : `<div class="avatar avatar-fallback">${esc(entry.unique_id[0].toUpperCase())}</div>`;
+  const name = entry.nickname ? esc(entry.nickname) : `@${esc(entry.unique_id)}`;
+  return `
+    <div class="follow-row" data-user="${esc(entry.unique_id)}">
+      ${avatar}
+      <div class="who"><div>${name}</div>
+        <div class="handle">@${esc(entry.unique_id)}</div></div>
+      <button data-add="${esc(entry.unique_id)}" class="primary">Add</button>
+    </div>`;
+}
+
+async function loadFollowing(force = false) {
+  followingMsg.textContent = 'Loading… (the first fetch can take a while)';
+  followingList.innerHTML = '';
+  try {
+    const resp = await api(`/api/following${force ? '?refresh=1' : ''}`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      followingMsg.textContent = data.detail || 'Could not load following list';
+      return;
+    }
+    followingLoaded = true;
+    followingList.innerHTML = data.following.map(followRowHtml).join('');
+    followingMsg.textContent = data.following.length
+      ? '' : 'Everyone you follow is already monitored.';
+  } catch (err) {
+    followingMsg.textContent = 'Could not load following list';
+  }
+}
+
+document.getElementById('following-section').addEventListener('toggle', (e) => {
+  if (e.target.open && !followingLoaded) loadFollowing();
+});
+
+document.getElementById('following-refresh').addEventListener('click', () => {
+  loadFollowing(true);
+});
+
+followingList.addEventListener('click', async (e) => {
+  const user = e.target.dataset?.add;
+  if (!user) return;
+  e.target.disabled = true;
+  const resp = await api('/api/users', {
+    method: 'POST', body: JSON.stringify({ user }),
+  });
+  if (resp.ok) {
+    followingList.querySelector(`[data-user="${CSS.escape(user)}"]`)?.remove();
+    if (!followingList.children.length) {
+      followingMsg.textContent = 'Everyone you follow is already monitored.';
+    }
+    refresh();
+  } else {
+    e.target.disabled = false;
+    alert((await resp.json()).detail || 'Could not add user');
+  }
 });
 
 refresh();

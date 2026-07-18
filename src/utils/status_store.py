@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS recordings (
 )
 """
 
+# Cosmetic profile data (display name, avatar) shown by the dashboard;
+# refreshed in the background by web.profiles.ProfileRefresher.
+_PROFILES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS profiles (
+    user TEXT PRIMARY KEY,
+    nickname TEXT,
+    avatar_url TEXT,
+    avatar_fetched_at REAL,
+    updated_at REAL NOT NULL
+)
+"""
+
 
 def status_db_path(output_dir=None) -> Path:
     directory = Path(output_dir) if output_dir else Path.cwd()
@@ -48,6 +60,7 @@ class StatusStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
+        self._conn.execute(_PROFILES_SCHEMA)
         self._conn.commit()
 
     def close(self):
@@ -109,6 +122,37 @@ class StatusStore:
     def remove(self, user):
         self._conn.execute("DELETE FROM recordings WHERE user = ?", [user])
         self._conn.commit()
+
+    def upsert_profile(
+        self, user, *, nickname=None, avatar_url=None, avatar_fetched_at=None
+    ):
+        """
+        Upsert ``user``'s profile row. None values never clobber existing
+        data; ``updated_at`` is always refreshed so it doubles as a
+        freshness marker for the background refresher.
+        """
+        self._conn.execute(
+            "INSERT INTO profiles "
+            "(user, nickname, avatar_url, avatar_fetched_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET "
+            "nickname=COALESCE(excluded.nickname, nickname), "
+            "avatar_url=COALESCE(excluded.avatar_url, avatar_url), "
+            "avatar_fetched_at="
+            "COALESCE(excluded.avatar_fetched_at, avatar_fetched_at), "
+            "updated_at=excluded.updated_at",
+            [user, nickname, avatar_url, avatar_fetched_at, time.time()],
+        )
+        self._conn.commit()
+
+    def profiles(self) -> dict:
+        """All profile rows, keyed by user."""
+        cursor = self._conn.execute(
+            "SELECT user, nickname, avatar_url, avatar_fetched_at, updated_at "
+            "FROM profiles"
+        )
+        names = [d[0] for d in cursor.description]
+        return {row[0]: dict(zip(names, row)) for row in cursor.fetchall()}
 
     def _rows(self, where="", params=()):
         cursor = self._conn.execute(

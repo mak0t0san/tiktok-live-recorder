@@ -130,6 +130,7 @@ class Supervisor:
         self.processes = {}  # user -> Process
         self.stop_events = {}  # user -> multiprocessing.Event
         self.stopped_users = set()  # stopped via stop_user(); excluded from restart
+        self.paused = False  # global pause: no starts/restarts while set
         self._restart_state = {}  # user -> {"count", "next_allowed", "started"}
         self._lock = threading.RLock()
 
@@ -180,10 +181,73 @@ class Supervisor:
         """Undo a stop_user: restart monitoring if the process is gone."""
         with self._lock:
             self.stopped_users.discard(user)
+            if self.paused:
+                # Only clear the stopped flag; the process starts on unpause.
+                logger.info(f"@{user} will resume once monitoring is unpaused")
+                return
             p = self.processes.get(user)
             if p is None or not p.is_alive():
                 self.start_user(user)
                 logger.info(f"Resumed monitoring @{user}")
+
+    def stop_all(self, force=False):
+        """
+        Cooperatively stop every managed user's recorder. Each user is
+        marked stopped (as with stop_user) and stays individually resumable.
+        Returns the users that were stopped.
+        """
+        with self._lock:
+            users = list(self.processes)
+        return [user for user in users if self.stop_user(user, force=force)]
+
+    def resume_all(self):
+        """Undo stop_user/stop_all for every stopped user in the users file."""
+        try:
+            users = read_users_file(self.args.users_file)
+        except OSError as e:
+            logger.error(f"Failed to read users file: {e}")
+            return []
+        resumed = []
+        with self._lock:
+            for user in users:
+                if user in self.stopped_users:
+                    self.resume_user(user)
+                    resumed.append(user)
+        return resumed
+
+    def pause(self):
+        """
+        Globally pause monitoring: cooperatively stop in-flight recordings
+        and prevent any starts/restarts until unpause(). Unlike stop_user,
+        users are NOT marked stopped, so unpausing restores the exact
+        per-user state from before the pause.
+        """
+        with self._lock:
+            if self.paused:
+                return
+            self.paused = True
+            for user, event in self.stop_events.items():
+                if user in self.stopped_users:
+                    continue
+                p = self.processes.get(user)
+                if p is not None and p.is_alive():
+                    event.set()
+        logger.info("Monitoring paused: in-flight recordings are finalizing")
+
+    def unpause(self):
+        """Resume monitoring after pause(): restart non-stopped users."""
+        with self._lock:
+            if not self.paused:
+                return
+            self.paused = False
+            for user, p in self.processes.items():
+                if user in self.stopped_users:
+                    continue
+                # Exits caused by the pause must not count as failures.
+                if not p.is_alive():
+                    self._restart_state.pop(user, None)
+        logger.info("Monitoring resumed")
+        self.sync_users()
 
     def remove_user(self, user, reason="removed from users file"):
         """Stop monitoring ``user`` entirely and forget its state."""
@@ -220,6 +284,10 @@ class Supervisor:
             self.remove_user(user)
 
         with self._lock:
+            if self.paused:
+                # Removals above are still honored; nothing starts or
+                # restarts while monitoring is paused.
+                return
             for user in users:
                 proc = self.processes.get(user)
                 if proc is None:

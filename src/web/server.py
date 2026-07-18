@@ -18,10 +18,12 @@ def run_web(args, mode, cookies):
         )
 
     from core.supervisor import Supervisor, install_shutdown_handlers
+    from core.tiktok_api import TikTokAPI
     from utils.status_store import status_db_path
     from web.app import create_app
     from web.auth import SessionAuth
     from web.preview import PreviewManager
+    from web.profiles import AVATAR_CACHE_DIRNAME, ProfileRefresher
 
     password = args.web_password or os.environ.get("TLR_WEB_PASSWORD")
     if not password:
@@ -44,6 +46,17 @@ def run_web(args, mode, cookies):
 
     previews = PreviewManager(ffmpeg_path=args.ffmpeg_path or "ffmpeg")
 
+    def api_factory():
+        return TikTokAPI(proxy=args.proxy, cookies=cookies)
+
+    profiles = ProfileRefresher(
+        status_db=status_db,
+        users_file=args.users_file,
+        api_factory=api_factory,
+        cache_dir=output_dir / AVATAR_CACHE_DIRNAME,
+    )
+    profiles.start()
+
     app = create_app(
         supervisor=supervisor,
         users_file=args.users_file,
@@ -51,11 +64,14 @@ def run_web(args, mode, cookies):
         auth=SessionAuth(password),
         status_db=status_db,
         previews=previews,
+        api_factory=api_factory,
+        profiles=profiles,
     )
 
     logger.info(f"Web UI listening on http://{args.web_host}:{args.web_port}")
     try:
         uvicorn.run(app, host=args.web_host, port=args.web_port, log_level="warning")
     finally:
+        profiles.shutdown()
         previews.shutdown()
         supervisor.shutdown()

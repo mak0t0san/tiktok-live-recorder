@@ -86,3 +86,34 @@ def test_null_reporter_is_a_noop():
 
 def test_status_db_path_uses_output_dir(tmp_path):
     assert status_db_path(tmp_path).parent == tmp_path
+
+
+def test_upsert_profile_creates_row(store):
+    store.upsert_profile("alice", nickname="Alice A", avatar_url="http://a/x.jpg")
+
+    profiles = store.profiles()
+    assert profiles["alice"]["nickname"] == "Alice A"
+    assert profiles["alice"]["avatar_url"] == "http://a/x.jpg"
+    assert profiles["alice"]["updated_at"] > 0
+
+
+def test_upsert_profile_none_never_clobbers(store):
+    store.upsert_profile("alice", nickname="Alice A", avatar_url="http://a/x.jpg")
+    before = store.profiles()["alice"]["updated_at"]
+
+    # partial update: only avatar_fetched_at; nickname/avatar_url survive
+    store.upsert_profile("alice", avatar_fetched_at=123.0)
+
+    profile = store.profiles()["alice"]
+    assert profile["nickname"] == "Alice A"
+    assert profile["avatar_url"] == "http://a/x.jpg"
+    assert profile["avatar_fetched_at"] == 123.0
+    assert profile["updated_at"] >= before
+
+
+def test_profiles_keyed_by_user(store):
+    store.upsert_profile("alice", nickname="A")
+    store.upsert_profile("bob", nickname="B")
+
+    profiles = store.profiles()
+    assert set(profiles) == {"alice", "bob"}

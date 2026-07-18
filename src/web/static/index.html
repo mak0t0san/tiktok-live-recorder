@@ -45,6 +45,36 @@
   .chip.stopped { background: #333; color: #bbb; }
   .meta { font-size: .8rem; color: #9aa; margin: .5rem 0; min-height: 1.2em; overflow-wrap: anywhere; }
   .actions { display: flex; gap: .45rem; flex-wrap: wrap; margin-top: .4rem; }
+  .card .id { display: flex; align-items: center; gap: .6rem; min-width: 0; }
+  .card .id > div { min-width: 0; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; object-fit: cover;
+    background: #2a2a35; flex: none;
+  }
+  .avatar-fallback {
+    display: flex; align-items: center; justify-content: center;
+    color: #9aa; font-weight: 600;
+  }
+  .handle { font-size: .78rem; color: #9aa; }
+  .section-head { display: flex; align-items: center; gap: .6rem; }
+  .section-head h2 { margin-right: auto; }
+  #paused-banner {
+    background: #4a3a15; color: #ffd98a; border-radius: 8px;
+    padding: .55rem .8rem; font-size: .85rem; margin-bottom: 1rem;
+  }
+  #following-section {
+    background: #16161c; border-radius: 10px; padding: .6rem .9rem;
+    margin-bottom: 1.2rem;
+  }
+  #following-section summary { cursor: pointer; color: #9aa; font-size: .88rem; }
+  .follow-head { display: flex; align-items: center; gap: .6rem; margin: .6rem 0; }
+  .follow-row {
+    display: flex; align-items: center; gap: .6rem; padding: .35rem 0;
+    border-bottom: 1px solid #24242e;
+  }
+  .follow-row:last-child { border-bottom: 0; }
+  .follow-row .who { min-width: 0; margin-right: auto; }
+  .follow-row .who div { overflow-wrap: anywhere; }
   video { width: 100%; border-radius: 8px; margin-top: .6rem; background: #000; aspect-ratio: 9 / 12; }
   table { width: 100%; border-collapse: collapse; font-size: .88rem; }
   th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #24242e; overflow-wrap: anywhere; }
@@ -58,14 +88,30 @@
 <body>
 <header>
   <h1>🎥 TikTok Live Recorder</h1>
-  <button id="logout">Log out</button>
+  <div style="display:flex; gap:.5rem">
+    <button id="pause-toggle" hidden>Pause monitoring</button>
+    <button id="logout">Log out</button>
+  </div>
 </header>
 <main>
-  <h2>Monitored users</h2>
+  <p id="paused-banner" hidden>⏸ Monitoring paused — no recordings will start until you resume.</p>
+  <div class="section-head">
+    <h2>Monitored users</h2>
+    <button id="resume-all" hidden>Resume all</button>
+    <button id="stop-all" class="danger" hidden>Stop all</button>
+  </div>
   <form id="add-form">
     <input id="add-user" placeholder="Add TikTok username (e.g. @someone)" autocomplete="off">
     <button class="primary" type="submit">Add</button>
   </form>
+  <details id="following-section">
+    <summary>Add from accounts you follow</summary>
+    <div class="follow-head">
+      <button id="following-refresh">Refresh</button>
+      <span id="following-msg" class="empty"></span>
+    </div>
+    <div id="following-list"></div>
+  </details>
   <div class="cards" id="cards"></div>
   <p class="empty" id="cards-empty" hidden>No users monitored yet — add one above.</p>
 

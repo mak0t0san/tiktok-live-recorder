@@ -140,3 +140,15 @@ dmypy.json
 
 .idea/
 .vscode/
+
+# recording lock files (per-user + global single-instance guard)
+.tiktok-recorder.lock
+.tiktok-rec.*.lock
+
+# web dashboard runtime state (status DB + cached avatar thumbnails)
+.tiktok-recorder-status.sqlite3*
+.tlr-avatar-cache/
+
+users.txt
+
+recordings/

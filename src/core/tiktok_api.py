@@ -12,6 +12,50 @@ from utils.custom_exceptions import (
     TikRecUnavailableError,
 )
 
+# Scene selector for /api/user/list/. NOTE: verify against a real account —
+# if the endpoint turns out to return followers instead of followed accounts,
+# fixing it is a matter of changing this one constant.
+USER_LIST_SCENE_FOLLOWING = 21
+
+# Stale-but-accepted seed token used only for the priming request that
+# harvests a fresh msToken from TikTok's response cookies.
+_SEED_MS_TOKEN = (
+    "GphHoLvRR4QxA5AWVwDkrs3AbumoK5H8toE8LVHtj6cce3ToGdXhMfvDWzOXG-0GXUWoaGVHrwG"
+    "NA4k_NnjuFFnHgv2S5eMjsvtkAhwMPa13xLmvP7tumx0KreFjPwTNnOj-BvAkPdO5Zrev3hoFBD9lHVo="
+)
+
+# Fixed web-fingerprint params shared by every /api/user/list/ request.
+_USER_LIST_STATIC_PARAMS = (
+    "WebIdLastTime=1747672102&aid=1988&app_language=it-IT&app_name=tiktok_web"
+    "&browser_language=it-IT&browser_name=Mozilla&browser_online=true"
+    "&browser_platform=Linux%20x86_64"
+    "&browser_version=5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36"
+    "%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F140.0.0.0%20Safari%2F537.36"
+    "&channel=tiktok_web&cookie_enabled=true&data_collection_enabled=true"
+    "&device_id=7506194516308166166&device_platform=web_pc&focus_state=true"
+    "&from_page=user&history_len=3&is_fullscreen=false&is_page_visible=true"
+    "&odinId=7246312836442604570&os=linux&priority_region=IT&referer=&region=IT"
+    "&screen_height=1080&screen_width=1920&tz_name=Europe%2FRome&user_is_login=true"
+    "&verifyFp=verify_mh4yf0uq_rdjp1Xwt_OoTk_4Jrf_AS8H_sp31opbnJFre"
+    "&webcast_language=it-IT"
+)
+
+
+def _extract_avatar(user_obj: dict) -> str | None:
+    """
+    Pull an avatar URL out of a TikTok user object. Depending on the endpoint
+    the avatar fields are either plain URL strings or {"urlList": [...]}.
+    """
+    for key in ("avatarThumb", "avatarMedium", "avatarLarger"):
+        value = user_obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            url_list = value.get("urlList") or value.get("url_list") or []
+            if url_list:
+                return url_list[0]
+    return None
+
 
 class TikTokAPI:
     def __init__(self, proxy, cookies):
@@ -246,61 +290,84 @@ class TikTokAPI:
         data = self._get_json(response)
         return (data.get("data") or {}).get("user", {}).get("roomId")
 
-    def get_followers_list(self, sec_uid) -> list:
+    def _user_list_url(self, *, sec_uid, cursor, ms_token, scene, count) -> str:
+        sec = f"&secUid={sec_uid}" if sec_uid else ""
+        return (
+            f"{self.BASE_URL}/api/user/list/?{_USER_LIST_STATIC_PARAMS}"
+            f"&count={count}&maxCursor={cursor}&minCursor={cursor}"
+            f"&scene={scene}{sec}&msToken={ms_token}&X-Bogus=&X-Gnarly="
+        )
+
+    def get_following(
+        self, sec_uid, scene=USER_LIST_SCENE_FOLLOWING, count=30
+    ) -> list[dict]:
         """
-        Returns all followers for the authenticated user by paginating
+        Paginate /api/user/list/ for the authenticated user and return rich
+        entries: {"unique_id", "nickname", "avatar_url"}. Returns [] when the
+        list is empty.
         """
-        followers = []
+        # Priming request: harvest a fresh msToken from the response cookies.
+        priming = self.http_client.get(
+            self._user_list_url(
+                sec_uid="",
+                cursor=0,
+                ms_token=_SEED_MS_TOKEN,
+                scene=scene,
+                count=count,
+            )
+        )
+        ms_token = priming.cookies.get("msToken")
+        if not ms_token:
+            raise TikTokRecorderError(
+                "TikTok session cookie missing or expired — update src/cookies.json"
+            )
+
+        entries = []
+        seen = set()
         cursor = 0
         has_more = True
 
-        ms_token = self.http_client.get(
-            f"{self.BASE_URL}/api/user/list/?"
-            "WebIdLastTime=1747672102&aid=1988&app_language=it-IT&app_name=tiktok_web&"
-            "browser_language=it-IT&browser_name=Mozilla&browser_online=true&"
-            "browser_platform=Linux%20x86_64&"
-            "browser_version=5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F140.0.0.0%20Safari%2F537.36&"
-            "channel=tiktok_web&cookie_enabled=true&count=5&data_collection_enabled=true&"
-            "device_id=7506194516308166166&device_platform=web_pc&focus_state=true&"
-            "from_page=user&history_len=3&is_fullscreen=false&is_page_visible=true&"
-            "maxCursor=0&minCursor=0&odinId=7246312836442604570&os=linux&priority_region=IT&"
-            "referer=&region=IT&root_referer=https%3A%2F%2Fwww.tiktok.com%2Flive&scene=21&"
-            "screen_height=1080&screen_width=1920&tz_name=Europe%2FRome&user_is_login=true&"
-            "verifyFp=verify_mh4yf0uq_rdjp1Xwt_OoTk_4Jrf_AS8H_sp31opbnJFre&webcast_language=it-IT&"
-            "msToken=GphHoLvRR4QxA5AWVwDkrs3AbumoK5H8toE8LVHtj6cce3ToGdXhMfvDWzOXG-0GXUWoaGVHrwGNA4k_NnjuFFnHgv2S5eMjsvtkAhwMPa13xLmvP7tumx0KreFjPwTNnOj-BvAkPdO5Zrev3hoFBD9lHVo=&X-Bogus=&X-Gnarly="
-        ).cookies["msToken"]
-
         while has_more:
-            url = (
-                "https://www.tiktok.com/api/user/list/?"
-                "WebIdLastTime=1747672102&aid=1988&app_language=it-IT&app_name=tiktok_web"
-                "&browser_language=it-IT&browser_name=Mozilla&browser_online=true"
-                "&browser_platform=Linux%20x86_64&browser_version=5.0%20%28X11%3B%20Linux%20x86_64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F140.0.0.0%20Safari%2F537.36&channel=tiktok_web&"
-                "cookie_enabled=true&count=5&data_collection_enabled=true&device_id=7506194516308166166"
-                "&device_platform=web_pc&focus_state=true&from_page=user&history_len=3&"
-                f"is_fullscreen=false&is_page_visible=true&maxCursor={cursor}&minCursor={cursor}&"
-                "odinId=7246312836442604570&os=linux&priority_region=IT&referer=&"
-                "region=IT&scene=21&screen_height=1080&screen_width=1920"
-                "&tz_name=Europe%2FRome&user_is_login=true&"
-                f"secUid={sec_uid}&verifyFp=verify_mh4yf0uq_rdjp1Xwt_OoTk_4Jrf_AS8H_sp31opbnJFre&"
-                f"webcast_language=it-IT&msToken={ms_token}&X-Bogus=&X-Gnarly="
+            response = self.http_client.get(
+                self._user_list_url(
+                    sec_uid=sec_uid,
+                    cursor=cursor,
+                    ms_token=ms_token,
+                    scene=scene,
+                    count=count,
+                )
             )
 
-            response = self.http_client.get(url)
-
             if response.status_code != StatusCode.OK:
-                raise TikTokRecorderError("Failed to retrieve followers list.")
+                raise TikTokRecorderError("Failed to retrieve user list.")
 
             if not response.content:
-                raise TikTokRecorderError("Empty response from TikTok followers API.")
+                # A 200 with an empty body is how TikTok rejects an unsigned
+                # /api/user/list/ request. Without a valid X-Bogus signature
+                # (which this client does not generate) the endpoint returns
+                # nothing — the same limitation that affects followers mode.
+                raise TikTokRecorderError(
+                    "TikTok returned no data for the following list. The "
+                    "account list endpoint now requires request signing that "
+                    "isn't available, or the session in src/cookies.json has "
+                    "expired."
+                )
 
             data = self._get_json(response)
-            user_list = data.get("userList", [])
 
-            for user in user_list:
-                username = user.get("user", {}).get("uniqueId")
-                if username:
-                    followers.append(username)
+            for entry in data.get("userList", []):
+                user = entry.get("user", {})
+                unique_id = user.get("uniqueId")
+                if not unique_id or unique_id in seen:
+                    continue
+                seen.add(unique_id)
+                entries.append(
+                    {
+                        "unique_id": unique_id,
+                        "nickname": user.get("nickname"),
+                        "avatar_url": _extract_avatar(user),
+                    }
+                )
 
             has_more = data.get("hasMore", False)
             new_cursor = data.get("minCursor", 0)
@@ -310,10 +377,49 @@ class TikTokAPI:
 
             cursor = new_cursor
 
+        return entries
+
+    def get_followers_list(self, sec_uid) -> list:
+        """
+        Returns all followers for the authenticated user by paginating
+        """
+        followers = [e["unique_id"] for e in self.get_following(sec_uid, count=5)]
+
         if not followers:
             raise TikTokRecorderError("Followers list is empty.")
 
         return followers
+
+    def get_user_details(self, user: str) -> dict | None:
+        """
+        Best-effort profile lookup (nickname, avatar) via the tikrec-signed
+        room API. Returns None when the data can't be fetched — profile info
+        is cosmetic and must never break callers.
+        """
+        try:
+            signed_url = self._tikrec_get_room_id_signed_url(user)
+        except TikRecUnavailableError:
+            return None
+
+        response = self.http_client.get(signed_url)
+        content = response.text
+        if not content or "Please wait" in content:
+            return None
+
+        try:
+            data = self._get_json(response)
+        except TikTokRecorderError:
+            return None
+
+        user_data = (data.get("data") or {}).get("user") or {}
+        if not user_data:
+            return None
+
+        return {
+            "unique_id": user_data.get("uniqueId") or user,
+            "nickname": user_data.get("nickname"),
+            "avatar_url": _extract_avatar(user_data),
+        }
 
     def _get_stream_url_from_page(self, user: str) -> str | None:
         """

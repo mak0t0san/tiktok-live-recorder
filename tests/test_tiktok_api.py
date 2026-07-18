@@ -9,10 +9,12 @@ from utils.custom_exceptions import (
 
 
 class FakeResponse:
-    def __init__(self, data, text="", status_code=200):
+    def __init__(self, data, text="", status_code=200, cookies=None, content=None):
         self._data = data
         self.text = text
         self.status_code = status_code
+        self.cookies = cookies if cookies is not None else {}
+        self.content = content if content is not None else b"x"
 
     def json(self):
         return self._data
@@ -33,6 +35,7 @@ class FakeHttpClient:
 
 def build_api(*responses):
     api = TikTokAPI.__new__(TikTokAPI)
+    api.BASE_URL = "https://www.tiktok.com"
     api.WEBCAST_URL = "https://webcast.tiktok.com"
     api.http_client = FakeHttpClient(list(responses))
     return api
@@ -267,3 +270,139 @@ def test_download_live_stream_closes_when_consumer_abandons_generator():
     gen.close()
 
     assert response.closed
+
+
+# -- following list -----------------------------------------------------------
+
+
+def _user_entry(unique_id, nickname=None, avatar=None):
+    user = {"uniqueId": unique_id}
+    if nickname:
+        user["nickname"] = nickname
+    if avatar:
+        user["avatarThumb"] = {"urlList": [avatar]}
+    return {"user": user}
+
+
+def _priming_response(ms_token="fresh-token"):
+    return FakeResponse({}, cookies={"msToken": ms_token} if ms_token else {})
+
+
+def test_get_following_returns_rich_entries_across_pages():
+    api = build_api(
+        _priming_response(),
+        {
+            "userList": [
+                _user_entry("alice", "Alice A", "http://cdn/alice.jpg"),
+                _user_entry("bob", "Bob B"),
+            ],
+            "hasMore": True,
+            "minCursor": 10,
+        },
+        {
+            "userList": [_user_entry("carol")],
+            "hasMore": False,
+            "minCursor": 20,
+        },
+    )
+
+    entries = api.get_following("sec-uid")
+
+    assert entries == [
+        {
+            "unique_id": "alice",
+            "nickname": "Alice A",
+            "avatar_url": "http://cdn/alice.jpg",
+        },
+        {"unique_id": "bob", "nickname": "Bob B", "avatar_url": None},
+        {"unique_id": "carol", "nickname": None, "avatar_url": None},
+    ]
+    # priming + two pages
+    assert len(api.http_client.urls) == 3
+    # pagination uses the harvested msToken, not the seed one
+    assert "msToken=fresh-token" in api.http_client.urls[1]
+
+
+def test_get_following_stops_when_cursor_repeats():
+    api = build_api(
+        _priming_response(),
+        {
+            "userList": [_user_entry("alice")],
+            "hasMore": True,
+            "minCursor": 0,  # cursor did not advance
+        },
+    )
+
+    entries = api.get_following("sec-uid")
+
+    assert [e["unique_id"] for e in entries] == ["alice"]
+    assert len(api.http_client.urls) == 2
+
+
+def test_get_following_missing_ms_token_raises_cookie_error():
+    api = build_api(_priming_response(ms_token=None))
+
+    with pytest.raises(TikTokRecorderError, match="cookies.json"):
+        api.get_following("sec-uid")
+
+
+def test_get_followers_list_still_returns_usernames():
+    api = build_api(
+        _priming_response(),
+        {
+            "userList": [_user_entry("alice", "Alice A"), _user_entry("bob")],
+            "hasMore": False,
+            "minCursor": 5,
+        },
+    )
+
+    assert api.get_followers_list("sec-uid") == ["alice", "bob"]
+
+
+def test_get_followers_list_raises_on_empty():
+    api = build_api(
+        _priming_response(),
+        {"userList": [], "hasMore": False, "minCursor": 0},
+    )
+
+    with pytest.raises(TikTokRecorderError, match="empty"):
+        api.get_followers_list("sec-uid")
+
+
+def test_get_user_details_parses_signed_response():
+    api = build_api(
+        # signed URL response (tikrec sign request is stubbed below)
+        FakeResponse(
+            {
+                "data": {
+                    "user": {
+                        "uniqueId": "alice",
+                        "nickname": "Alice A",
+                        "avatarThumb": "http://cdn/alice.jpg",
+                        "roomId": "42",
+                    }
+                }
+            },
+            text="ok",
+        ),
+    )
+    api._tikrec_get_room_id_signed_url = lambda user: "https://signed"
+
+    assert api.get_user_details("alice") == {
+        "unique_id": "alice",
+        "nickname": "Alice A",
+        "avatar_url": "http://cdn/alice.jpg",
+    }
+
+
+def test_get_user_details_returns_none_when_tikrec_down():
+    from utils.custom_exceptions import TikRecUnavailableError
+
+    api = build_api()
+
+    def boom(user):
+        raise TikRecUnavailableError("down")
+
+    api._tikrec_get_room_id_signed_url = boom
+
+    assert api.get_user_details("alice") is None

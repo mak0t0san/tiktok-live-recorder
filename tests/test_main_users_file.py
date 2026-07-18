@@ -229,3 +229,78 @@ def test_stop_event_reaches_recorder_config(monkeypatch, tmp_path):
 
     config = FakeProcess.instances[0].args[0]
     assert config.stop_event is sup.stop_events["alice"]
+
+
+def test_stop_all_marks_everyone_stopped(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice", "bob"])
+
+    stopped = sup.stop_all()
+
+    assert set(stopped) == {"alice", "bob"}
+    assert sup.stopped_users == {"alice", "bob"}
+    assert sup.stop_events["alice"].is_set()
+    assert sup.stop_events["bob"].is_set()
+    # cooperative: nothing terminated
+    assert not any(p.terminated for p in FakeProcess.instances)
+
+
+def test_resume_all_restarts_all_stopped_users(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice", "bob"])
+    sup.stop_all()
+    for proc in FakeProcess.instances:
+        proc.alive = False
+
+    resumed = sup.resume_all()
+
+    assert set(resumed) == {"alice", "bob"}
+    assert sup.stopped_users == set()
+    assert len(FakeProcess.instances) == 4
+
+
+def test_pause_sets_events_without_marking_stopped(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice", "bob"])
+    sup.stop_user("bob")
+
+    sup.pause()
+
+    assert sup.paused
+    assert sup.stop_events["alice"].is_set()
+    assert "alice" not in sup.stopped_users
+    assert sup.stopped_users == {"bob"}
+
+    # sync must not restart anything while paused
+    for proc in FakeProcess.instances:
+        proc.alive = False
+    sup.sync_users()
+    assert len(FakeProcess.instances) == 2
+
+
+def test_unpause_restarts_only_non_stopped_users(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice", "bob"])
+    sup.stop_user("bob")
+    sup.pause()
+    for proc in FakeProcess.instances:
+        proc.alive = False
+
+    sup.unpause()
+
+    assert not sup.paused
+    # alice restarted with a fresh, unset stop event; bob stays stopped
+    assert len(FakeProcess.instances) == 3
+    assert not sup.stop_events["alice"].is_set()
+    assert "bob" in sup.stopped_users
+
+
+def test_resume_user_while_paused_defers_start(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice"])
+    sup.stop_user("alice")
+    FakeProcess.instances[0].alive = False
+    sup.pause()
+
+    sup.resume_user("alice")
+
+    assert "alice" not in sup.stopped_users
+    assert len(FakeProcess.instances) == 1  # nothing spawned while paused
+
+    sup.unpause()
+    assert len(FakeProcess.instances) == 2
