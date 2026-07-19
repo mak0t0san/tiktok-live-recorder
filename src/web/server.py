@@ -19,7 +19,7 @@ def run_web(args, mode, cookies):
 
     from core.supervisor import Supervisor, install_shutdown_handlers
     from core.tiktok_api import TikTokAPI
-    from utils.status_store import status_db_path
+    from utils.status_store import StatusStore, status_db_path
     from web.app import create_app
     from web.auth import SessionAuth
     from web.preview import PreviewManager
@@ -38,6 +38,11 @@ def run_web(args, mode, cookies):
     status_db = status_db_path(output_dir)
 
     supervisor = Supervisor(args, mode, cookies, status_db=status_db)
+    store = StatusStore(status_db)
+    try:
+        supervisor.preseed_stopped(store.paused_users())
+    finally:
+        store.close()
     supervisor.sync_users()
     install_shutdown_handlers(supervisor.processes)
 
@@ -64,8 +69,7 @@ def run_web(args, mode, cookies):
         auth=SessionAuth(password),
         status_db=status_db,
         previews=previews,
-        api_factory=api_factory,
-        profiles=profiles,
+        ffmpeg_path=args.ffmpeg_path or "ffmpeg",
     )
 
     logger.info(f"Web UI listening on http://{args.web_host}:{args.web_port}")

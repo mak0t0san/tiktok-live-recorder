@@ -304,3 +304,94 @@ def test_resume_user_while_paused_defers_start(monkeypatch, tmp_path):
 
     sup.unpause()
     assert len(FakeProcess.instances) == 2
+
+
+# -- persisted per-user pause (preseed) -----------------------------------------
+
+
+def test_preseed_stopped_prevents_start(monkeypatch, tmp_path):
+    _patch_process(monkeypatch)
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("alice\nbob\n")
+    sup = Supervisor(_args(users_file), Mode.AUTOMATIC, cookies={})
+
+    sup.preseed_stopped(["alice"])
+    sup.sync_users()
+
+    # only bob got a process; alice stays paused with none
+    assert len(FakeProcess.instances) == 1
+    assert set(sup.processes) == {"bob"}
+    assert sup.stopped_users == {"alice"}
+
+    # later syncs don't start her either
+    sup.sync_users()
+    assert len(FakeProcess.instances) == 1
+
+
+def test_preseed_stopped_user_resumes_normally(monkeypatch, tmp_path):
+    _patch_process(monkeypatch)
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("alice\n")
+    sup = Supervisor(_args(users_file), Mode.AUTOMATIC, cookies={})
+    sup.preseed_stopped(["alice"])
+    sup.sync_users()
+    assert FakeProcess.instances == []
+
+    sup.resume_user("alice")
+    assert len(FakeProcess.instances) == 1
+    assert sup.stopped_users == set()
+
+
+def test_cli_seeds_paused_users_from_status_db(monkeypatch, tmp_path):
+    from utils.status_store import StatusStore, status_db_path
+
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("alice\nbob\n")
+    args = _args(users_file)
+    args.output = str(tmp_path)
+
+    store = StatusStore(status_db_path(tmp_path))
+    store.set_paused("alice", True)
+    store.close()
+
+    _patch_process(monkeypatch)
+    monkeypatch.setattr(
+        "time.sleep", lambda s: (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+    main.run_recordings_from_file(args, Mode.AUTOMATIC, cookies={})
+
+    started_users = {p.args[0].user for p in FakeProcess.instances}
+    assert started_users == {"bob"}
+
+
+# -- check_now ("check now" wake event) -----------------------------------------
+
+
+def test_wake_event_reaches_recorder_config(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice"])
+
+    config = FakeProcess.instances[0].args[0]
+    assert config.wake_event is sup.wake_events["alice"]
+
+
+def test_check_now_sets_wake_event_for_live_user(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice"])
+
+    assert sup.check_now("alice") is True
+    assert sup.wake_events["alice"].is_set()
+
+
+def test_check_now_refuses_stopped_paused_dead_or_unknown(monkeypatch, tmp_path):
+    sup = _supervisor(monkeypatch, tmp_path, ["alice", "bob"])
+
+    assert sup.check_now("nobody") is False
+
+    sup.stop_user("alice")
+    assert sup.check_now("alice") is False
+
+    FakeProcess.instances[1].alive = False  # bob's process died
+    assert sup.check_now("bob") is False
+
+    sup2 = _supervisor(monkeypatch, tmp_path, ["carol"])
+    sup2.paused = True
+    assert sup2.check_now("carol") is False

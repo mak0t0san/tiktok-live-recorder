@@ -6,7 +6,6 @@ recording state comes from the SQLite status store, and the list of monitored
 users lives in the users file (shared with the CLI).
 """
 
-import threading
 import time
 from pathlib import Path
 
@@ -15,14 +14,11 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from utils.custom_exceptions import TikTokRecorderError
 from utils.utils import add_user_to_file, read_users_file, remove_user_from_file
 from utils.status_store import StatusStore
+from utils.video_management import VideoManagement
 from web.auth import SESSION_COOKIE, SESSION_MAX_AGE
 from web.profiles import AVATAR_CACHE_DIRNAME
-
-# How long a fetched following list stays served from cache.
-FOLLOWING_CACHE_TTL = 300
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -50,8 +46,7 @@ def create_app(
     auth,
     status_db,
     previews=None,
-    api_factory=None,
-    profiles=None,
+    ffmpeg_path="ffmpeg",
 ):
     app = FastAPI(title="TikTok Live Recorder", docs_url=None, redoc_url=None)
     users_file = Path(users_file)
@@ -110,6 +105,8 @@ def create_app(
         try:
             rows = {row["user"]: row for row in store.all()}
             profile_rows = store.profiles()
+            paused_set = store.paused_users()
+            history = store.latest_history()
         finally:
             store.close()
 
@@ -118,6 +115,7 @@ def create_app(
             proc = procs.get(user, {})
             row = rows.get(user, {})
             profile = profile_rows.get(user, {})
+            last = history.get(user, {})
             entries.append(
                 {
                     "user": user,
@@ -130,6 +128,9 @@ def create_app(
                     "monitored": user in users,
                     "alive": proc.get("alive", False),
                     "stopped": proc.get("stopped", False),
+                    "paused": user in paused_set or proc.get("stopped", False),
+                    "last_recorded_at": last.get("ended_at"),
+                    "last_duration": last.get("duration"),
                     "pid": proc.get("pid"),
                     "state": row.get("state", "starting" if proc else "unknown"),
                     "room_id": row.get("room_id"),
@@ -163,58 +164,6 @@ def create_app(
             headers={"Cache-Control": "max-age=3600"},
         )
 
-    # -- following picker -----------------------------------------------------
-
-    following_cache = {"entries": None, "fetched_at": 0.0, "sec_uid": None}
-    following_lock = threading.Lock()
-
-    @app.get("/api/following")
-    def following(refresh: bool = False):
-        if api_factory is None:
-            return JSONResponse(
-                {"detail": "No TikTok session configured"}, status_code=503
-            )
-
-        # The lock also serializes concurrent fetches so at most one slow
-        # TikTok pagination runs at a time.
-        with following_lock:
-            expired = time.time() - following_cache["fetched_at"] > FOLLOWING_CACHE_TTL
-            if refresh or following_cache["entries"] is None or expired:
-                api = api_factory()
-                try:
-                    sec_uid = following_cache["sec_uid"] or api.get_sec_uid()
-                    if not sec_uid:
-                        return JSONResponse(
-                            {
-                                "detail": "Could not resolve your TikTok "
-                                "account — check src/cookies.json"
-                            },
-                            status_code=502,
-                        )
-                    entries = api.get_following(sec_uid)
-                except TikTokRecorderError as e:
-                    return JSONResponse({"detail": str(e)}, status_code=502)
-                finally:
-                    api.close()
-                following_cache.update(
-                    entries=entries, fetched_at=time.time(), sec_uid=sec_uid
-                )
-                if profiles is not None:
-                    profiles.seed(entries)
-
-            # Filter against the users file at request time so a just-added
-            # user disappears from the picker immediately.
-            listed = {u.lower() for u in read_users_file(users_file)}
-            visible = [
-                e
-                for e in following_cache["entries"]
-                if e["unique_id"].lower() not in listed
-            ]
-            return {
-                "following": visible,
-                "fetched_at": following_cache["fetched_at"],
-            }
-
     # -- users file ---------------------------------------------------------
 
     @app.get("/api/users")
@@ -236,20 +185,36 @@ def create_app(
     def delete_user(user: str):
         removed = remove_user_from_file(users_file, user)
         supervisor.remove_user(user, reason="removed via web UI")
+        store = StatusStore(status_db)
+        try:
+            store.remove(user)
+        finally:
+            store.close()
         if not removed:
             return JSONResponse({"detail": "User not listed"}, status_code=404)
         return {"ok": True}
 
     # -- recording control --------------------------------------------------
 
+    def _persist_paused(users, paused):
+        store = StatusStore(status_db)
+        try:
+            for user in users:
+                store.set_paused(user, paused)
+        finally:
+            store.close()
+
     @app.post("/api/recordings/stop-all")
     def stop_all_recordings(body: StopBody | None = None):
         stopped = supervisor.stop_all(force=bool(body and body.force))
+        _persist_paused(stopped, True)
         return {"ok": True, "stopped": stopped}
 
     @app.post("/api/recordings/resume-all")
     def resume_all_recordings():
-        return {"ok": True, "resumed": supervisor.resume_all()}
+        resumed = supervisor.resume_all()
+        _persist_paused(resumed, False)
+        return {"ok": True, "resumed": resumed}
 
     @app.post("/api/monitoring/pause")
     def pause_monitoring():
@@ -263,25 +228,61 @@ def create_app(
 
     @app.post("/api/recordings/{user}/stop")
     def stop_recording(user: str, body: StopBody | None = None):
-        force = bool(body and body.force)
-        if not supervisor.stop_user(user, force=force):
-            return JSONResponse({"detail": "No recorder for that user"}, 404)
+        # Keyed on the users file (not on a live process) so a user paused at
+        # startup — who has no process — can still be managed.
+        if user not in read_users_file(users_file):
+            return JSONResponse({"detail": "User is not monitored"}, 404)
+        if not supervisor.stop_user(user, force=bool(body and body.force)):
+            # no live process: still exclude the user from future restarts
+            supervisor.preseed_stopped([user])
+        _persist_paused([user], True)
         return {"ok": True}
 
     @app.post("/api/recordings/{user}/resume")
     def resume_recording(user: str):
         if user not in read_users_file(users_file):
             return JSONResponse({"detail": "User is not monitored"}, 404)
+        _persist_paused([user], False)
         supervisor.resume_user(user)
         return {"ok": True}
 
+    @app.post("/api/recordings/{user}/check-now")
+    def check_now(user: str):
+        if supervisor.check_now(user):
+            return {"ok": True}
+        return JSONResponse(
+            {"detail": "User is paused or not actively monitored"}, status_code=409
+        )
+
     # -- completed recordings -----------------------------------------------
+
+    def _active_raw_outputs() -> set[str]:
+        store = StatusStore(status_db)
+        try:
+            rows = store.all()
+        finally:
+            store.close()
+
+        active = set()
+        for row in rows:
+            output_path = row.get("output_path")
+            if not output_path:
+                continue
+            output_name = Path(output_path).name
+            if not output_name.endswith("_flv.mp4"):
+                continue
+            if row.get("state") in {"stopped", "error", "stale"}:
+                continue
+            active.add(output_name)
+        return active
 
     @app.get("/api/files")
     def list_files():
+        active_raw_outputs = _active_raw_outputs()
         files = []
         for path in output_dir.glob("*.mp4"):
             stat = path.stat()
+            raw = path.name.endswith("_flv.mp4")
             files.append(
                 {
                     "name": path.name,
@@ -289,11 +290,38 @@ def create_app(
                     "mtime": stat.st_mtime,
                     # still-raw FLV data (recording in progress or conversion
                     # failed); converted files drop the _flv suffix
-                    "raw": path.name.endswith("_flv.mp4"),
+                    "raw": raw,
+                    "convertible": raw and path.name not in active_raw_outputs,
                 }
             )
         files.sort(key=lambda f: f["mtime"], reverse=True)
         return {"files": files}
+
+    @app.post("/api/files/{name}/convert")
+    def convert_file(name: str):
+        target = (output_dir / name).resolve()
+        if target.parent != output_dir.resolve() or target.suffix != ".mp4":
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        if not target.is_file():
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        if not target.name.endswith("_flv.mp4"):
+            return JSONResponse(
+                {"detail": "Only raw _flv.mp4 files can be converted"},
+                status_code=409,
+            )
+
+        if target.name in _active_raw_outputs():
+            return JSONResponse(
+                {"detail": "File is still being recorded or converted"},
+                status_code=409,
+            )
+
+        converted = VideoManagement.convert_flv_to_mp4(
+            str(target), ffmpeg_path=ffmpeg_path
+        )
+        if not converted:
+            return JSONResponse({"detail": "Conversion failed"}, status_code=500)
+        return {"ok": True, "name": Path(converted).name}
 
     @app.get("/files/{name}")
     def download_file(name: str):
@@ -309,6 +337,81 @@ def create_app(
 
     if previews is not None:
         previews.register(app, status_db=status_db)
+
+    # -- diagnostics --------------------------------------------------------
+
+    def _probe_health(base_url: str, timeout: int = 5) -> tuple[bool, str]:
+        """
+        Try to reach a service's /health endpoint.
+
+        Returns (reachable: bool, detail: str).
+        """
+        probe = base_url.rstrip("/") + "/health"
+        try:
+            try:
+                from curl_cffi import requests as cffi_requests
+
+                r = cffi_requests.get(probe, timeout=timeout)
+                if r.status_code < 600:
+                    return True, f"HTTP {r.status_code}"
+            except ImportError:
+                pass
+            try:
+                import requests as req_lib
+
+                r = req_lib.get(probe, timeout=timeout)
+                if r.status_code < 600:
+                    return True, f"HTTP {r.status_code}"
+            except ImportError:
+                pass
+            import urllib.request
+
+            with urllib.request.urlopen(probe, timeout=timeout) as resp:
+                return True, f"HTTP {resp.status}"
+        except Exception as exc:
+            return False, str(exc)
+
+    @app.get("/api/diagnostics")
+    def diagnostics():
+        """
+        Return a snapshot of key service health indicators that the dashboard
+        can display as a diagnostics panel.
+
+        Fields
+        ------
+        cookies_file      : str          — path to src/cookies.json
+        cookies_present   : bool         — file exists and is non-empty
+        cookies_hint      : str          — actionable advice
+
+        tikrec_url        : str          — tikrec signing service base URL
+        tikrec_reachable  : bool | null  — probe result
+        tikrec_detail     : str | null   — human-readable probe outcome
+        """
+        result: dict = {}
+
+        # --- cookies ---
+        cookies_path = Path(__file__).parent.parent / "cookies.json"
+        cookies_present = cookies_path.is_file() and cookies_path.stat().st_size > 10
+        result["cookies_file"] = str(cookies_path)
+        result["cookies_present"] = cookies_present
+        result["cookies_hint"] = (
+            "cookies.json found — if TikTok calls fail, try refreshing the "
+            "session cookies."
+            if cookies_present
+            else (
+                "cookies.json is missing or empty. Copy a valid TikTok session "
+                "cookie JSON to src/cookies.json to enable authenticated requests."
+            )
+        )
+
+        # --- tikrec ---
+        tikrec_url = "https://tikrec.com"
+        result["tikrec_url"] = tikrec_url
+        tikrec_reachable, tikrec_detail = _probe_health(tikrec_url, timeout=6)
+        result["tikrec_reachable"] = tikrec_reachable
+        result["tikrec_detail"] = tikrec_detail
+
+        return result
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

@@ -1,7 +1,7 @@
 import time
 from http.client import HTTPException
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event
 
 from requests import HTTPError, RequestException
 
@@ -46,6 +46,10 @@ class TikTokRecorder:
             config.stop_event if config.stop_event is not None else Event()
         )
 
+        # Optional "check now" signal from the parent: interrupts the
+        # automatic-mode recheck sleep without stopping the recorder.
+        self._wake_event = config.wake_event
+
         # Best-effort status reporting for the web dashboard; a no-op unless
         # a status database path was provided (real reporter is attached in
         # run() once the username is resolved).
@@ -54,34 +58,23 @@ class TikTokRecorder:
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
-        if self.mode == Mode.FOLLOWERS:
-            self.check_country_blacklisted()
+        if self.url:
+            self.user, self.room_id = self.tiktok.get_room_and_user_from_url(self.url)
 
-            self.sec_uid = self.tiktok.get_sec_uid()
-            if self.sec_uid is None:
-                raise TikTokRecorderError("Failed to retrieve sec_uid.")
+        if not self.user:
+            self.user = self.tiktok.get_user_from_room_id(self.room_id)
 
-            logger.info("Followers mode activated\n")
-        else:
-            if self.url:
-                self.user, self.room_id = self.tiktok.get_room_and_user_from_url(
-                    self.url
-                )
+        if not self.room_id:
+            self.room_id = self.tiktok.get_room_id_from_user(self.user)
 
-            if not self.user:
-                self.user = self.tiktok.get_user_from_room_id(self.room_id)
+        self.check_country_blacklisted()
 
-            if not self.room_id:
-                self.room_id = self.tiktok.get_room_id_from_user(self.user)
-
-            self.check_country_blacklisted()
-
-            logger.info(f"USERNAME: {self.user}" + ("\n" if not self.room_id else ""))
-            if self.room_id:
-                logger.info(
-                    f"ROOM_ID:  {self.room_id}"
-                    + ("\n" if not self.tiktok.is_room_alive(self.room_id) else "")
-                )
+        logger.info(f"USERNAME: {self.user}" + ("\n" if not self.room_id else ""))
+        if self.room_id:
+            logger.info(
+                f"ROOM_ID:  {self.room_id}"
+                + ("\n" if not self.tiktok.is_room_alive(self.room_id) else "")
+            )
 
         # If proxy was used for the initial checks, switch to a direct connection
         # for the actual stream download to avoid proxy bottlenecks
@@ -98,10 +91,6 @@ class TikTokRecorder:
         If the mode is AUTOMATIC, it continuously checks if the user is live
         and if not, waits for the specified timeout before rechecking.
         If the user is live, it starts recording.
-
-        if the mode is FOLLOWERS, it continuously checks the followers of
-        the authenticated user. If any follower is live, it starts recording
-        their live stream in a separate process.
         """
         self._setup()
 
@@ -115,9 +104,6 @@ class TikTokRecorder:
         elif self.mode == Mode.AUTOMATIC:
             self.automatic_mode()
 
-        elif self.mode == Mode.FOLLOWERS:
-            self.followers_mode()
-
     def manual_mode(self):
         if not self.tiktok.is_room_alive(self.room_id):
             raise UserLiveError(f"@{self.user}: {TikTokError.USER_NOT_CURRENTLY_LIVE}")
@@ -127,9 +113,27 @@ class TikTokRecorder:
     def _wait_or_stop(self, seconds) -> bool:
         """
         Idle for up to ``seconds``, waking early if a cooperative stop is
-        requested. Returns True when a stop was requested.
+        requested (returns True) or a manual "check now" is requested via the
+        wake event (returns False, so the caller re-checks liveness).
         """
-        return self._stop_event.wait(seconds)
+        if self._wake_event is None:
+            return self._stop_event.wait(seconds)
+
+        # Drop wakes that queued up while we were busy (e.g. recording), so
+        # a stale request doesn't skip the very next recheck sleep.
+        self._wake_event.clear()
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # 1s slices keep stop latency unchanged while letting the wake
+            # event interrupt the sleep.
+            if self._stop_event.wait(min(1.0, remaining)):
+                return True
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return False
 
     def automatic_mode(self):
         while not self._stop_event.is_set():
@@ -165,101 +169,6 @@ class TikTokRecorder:
             logger.info(f"Stop requested; @{self.user} monitoring ended.")
             self._status.report(state="stopped")
 
-    def followers_mode(self):
-        active_recordings = {}  # follower -> Thread
-
-        while True:
-            try:
-                followers = self.tiktok.get_followers_list(self.sec_uid)
-
-                for follower in followers:
-                    if follower in active_recordings:
-                        if not active_recordings[follower].is_alive():
-                            logger.info(f"Recording of @{follower} finished.")
-                            del active_recordings[follower]
-                        else:
-                            continue
-
-                    try:
-                        room_id = self.tiktok.get_room_id_from_user(follower)
-
-                        if not room_id or not self.tiktok.is_room_alive(room_id):
-                            continue
-
-                        logger.info(f"@{follower} is live. Starting recording...")
-
-                        thread = Thread(
-                            target=self._record_follower,
-                            args=(follower, room_id),
-                        )
-                        thread.start()
-                        active_recordings[follower] = thread
-
-                        time.sleep(2.5)
-
-                    except TikTokRecorderError as e:
-                        logger.error(f"Error while processing @{follower}: {e}")
-                        continue
-
-                    except Exception as e:
-                        logger.error(
-                            f"Unexpected error processing @{follower}: {e}",
-                            exc_info=True,
-                        )
-                        continue
-
-                print()
-                logger.info(
-                    f"Waiting {self.automatic_interval} minutes for the next check..."
-                )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
-
-            except (UserLiveError, LiveNotFound) as ex:
-                logger.info(ex)
-                logger.info(
-                    f"Waiting {self.automatic_interval} minutes before recheck\n"
-                )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
-
-            except (ConnectionError, RequestException, HTTPException):
-                logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
-
-            except KeyboardInterrupt:
-                self._shutdown_recordings(active_recordings)
-                raise
-
-    def _record_follower(self, follower, room_id):
-        """
-        Thread target for followers mode: record a follower, swallowing
-        AlreadyRecording (another instance holds the lock) so a lock miss
-        doesn't dump a thread traceback.
-        """
-        try:
-            self.start_recording(follower, room_id)
-        except AlreadyRecording as ex:
-            logger.info(ex)
-
-    def _shutdown_recordings(self, active_recordings: dict) -> None:
-        """
-        Signal worker threads to stop and wait for them to finalize
-        (flush + convert) their recordings.
-        """
-        self._stop_event.set()
-
-        alive = {u: t for u, t in active_recordings.items() if t.is_alive()}
-        if not alive:
-            return
-
-        logger.info(f"Stopping {len(alive)} active recording(s), please wait...")
-        for follower, thread in alive.items():
-            thread.join(timeout=30)
-            if thread.is_alive():
-                logger.warning(
-                    f"Recording of @{follower} did not stop in time; "
-                    "its file may be left unconverted."
-                )
-
     def _build_output_path(self, user: str) -> str:
         filename = (
             f"TK_{user}_{time.strftime('%Y.%m.%d_%H-%M-%S', time.localtime())}_flv.mp4"
@@ -293,11 +202,12 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         output = self._build_output_path(user)
+        started_at = time.time()
         self._status.report(
             state="recording",
             room_id=room_id,
             output_path=output,
-            started_at=time.time(),
+            started_at=started_at,
             bytes_written=0,
         )
 
@@ -424,12 +334,28 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
+        # Written before conversion so a crashed/hung ffmpeg still leaves a
+        # history row; the same (user, started_at) row is updated with the
+        # converted path below.
+        ended_at = time.time()
+        self._status.record_session(
+            started_at=started_at,
+            ended_at=ended_at,
+            bytes_written=bytes_written,
+            output_path=output,
+        )
         self._status.report(state="converting", bytes_written=bytes_written)
         converted = VideoManagement.convert_flv_to_mp4(
             output, self.bitrate, self.ffmpeg_path
         )
         if converted:
             self._status.report(state="converting", output_path=str(converted))
+            self._status.record_session(
+                started_at=started_at,
+                ended_at=ended_at,
+                bytes_written=bytes_written,
+                output_path=str(converted),
+            )
 
         # skip the upload on Ctrl+C so the program exits promptly
         if self.use_telegram and converted and not interrupted:
@@ -451,8 +377,5 @@ class TikTokRecorder:
 
         if self.mode == Mode.AUTOMATIC:
             raise TikTokRecorderError(TikTokError.COUNTRY_BLACKLISTED_AUTO_MODE)
-
-        elif self.mode == Mode.FOLLOWERS:
-            raise TikTokRecorderError(TikTokError.COUNTRY_BLACKLISTED_FOLLOWERS_MODE)
 
         return is_blacklisted

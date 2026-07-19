@@ -21,6 +21,9 @@ class RecorderConfig:
     # request a cooperative stop; the recorder finalizes the in-flight
     # recording and exits instead of being killed mid-file.
     stop_event: object | None = None
+    # Optional multiprocessing.Event set by the parent to make automatic mode
+    # re-check liveness immediately instead of finishing the recheck sleep.
+    wake_event: object | None = None
     # Optional path to the SQLite status database; when set, the recorder
     # reports its state there for the web dashboard.
     status_db: str | None = None

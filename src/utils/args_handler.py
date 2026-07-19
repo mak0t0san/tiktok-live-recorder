@@ -55,10 +55,9 @@ def parse_args():
         "-mode",
         dest="mode",
         help=(
-            "Recording mode: (manual, automatic, followers) [Default: manual]\n"
+            "Recording mode: (manual, automatic) [Default: manual]\n"
             "[manual] => Manual live recording.\n"
-            "[automatic] => Automatic live recording when the user is live.\n"
-            "[followers] => Automatic live recording of followed users."
+            "[automatic] => Automatic live recording when the user is live."
         ),
         default="manual",
         action="store",
@@ -201,11 +200,11 @@ def validate_and_parse_args():
 
     if not args.mode:
         raise ArgsParseError(
-            "Missing mode value. Please specify the mode (manual, automatic or followers)."
+            "Missing mode value. Please specify the mode (manual or automatic)."
         )
-    if args.mode not in ["manual", "automatic", "followers"]:
+    if args.mode not in ["manual", "automatic"]:
         raise ArgsParseError(
-            "Incorrect mode value. Choose between 'manual', 'automatic' or 'followers'."
+            "Incorrect mode value. Choose between 'manual' or 'automatic'."
         )
 
     if args.users_file:
@@ -218,11 +217,10 @@ def validate_and_parse_args():
         if not os.path.isfile(args.users_file):
             raise ArgsParseError(f"Users file not found: {args.users_file}")
 
-    if args.mode in ["manual", "automatic"]:
-        if not args.user and not args.room_id and not args.url and not args.users_file:
-            raise ArgsParseError(
-                "Missing URL, username, or room ID. Please provide one of these parameters."
-            )
+    if not args.user and not args.room_id and not args.url and not args.users_file:
+        raise ArgsParseError(
+            "Missing URL, username, or room ID. Please provide one of these parameters."
+        )
 
     if args.user:
         args.user = [
@@ -267,7 +265,5 @@ def validate_and_parse_args():
         mode = Mode.MANUAL
     elif args.mode == "automatic":
         mode = Mode.AUTOMATIC
-    elif args.mode == "followers":
-        mode = Mode.FOLLOWERS
 
     return args, mode

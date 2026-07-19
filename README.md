@@ -117,7 +117,7 @@ uv run python src/main.py [options]
 | `-url <URL>` | TikTok live URL to record from. |
 | `-room_id <ROOM_ID>` | Room ID to record from. |
 | `-users-file <PATH>` | Path to a text file listing usernames to monitor in automatic mode, one per line (`#` starts a comment). Re-read periodically, so usernames can be added or removed while running; removing one stops its recording. Cannot be combined with `-user`, `-room_id`, or `-url`. |
-| `-mode <MODE>` | Recording mode: `manual`, `automatic`, `followers`. |
+| `-mode <MODE>` | Recording mode: `manual`, `automatic`. |
 | `-automatic_interval <MIN>` | Polling interval in minutes (automatic mode only). |
 | `-output <DIRECTORY>` | Directory where recordings will be saved. |
 | `-duration <SECONDS>` | Stop recording after this many seconds. |
@@ -134,7 +134,6 @@ uv run python src/main.py [options]
 
 - **`manual`** *(default)*: Records immediately if the user is currently live.
 - **`automatic`**: Polls at regular intervals and records whenever the user goes live.
-- **`followers`**: Automatically records live streams from all followed users.
 
 ## Web Dashboard
 
@@ -157,7 +156,15 @@ in with the password. From the dashboard you can:
   user, updated every couple of seconds.
 - **Stop individual recordings** — a stop finalizes the file (flush + MP4
   conversion) instead of killing the recorder mid-write; **Resume** restarts
-  monitoring afterwards.
+  monitoring afterwards. Stops are persistent: a stopped (paused) user stays
+  paused across dashboard restarts until you resume them, without losing
+  their place in the users file.
+- **Check now** — trigger an immediate liveness check for a waiting user
+  instead of waiting out the recheck interval (default 5 minutes).
+- **Sort the user grid** — by recording status, username, or display name;
+  the choice is remembered per browser.
+- **See recording history at a glance** — each card shows when the user was
+  last recorded and how long that recording ran.
 - **Preview live streams** — an on-demand HLS player fed from the recording
   already being written to disk (no extra TikTok connection, no re-encoding).
   Previews shut down automatically ~30 s after the last viewer leaves.

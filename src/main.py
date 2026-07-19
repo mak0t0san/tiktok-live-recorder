@@ -8,10 +8,22 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def run_recordings_from_file(args, mode, cookies):
     from core.supervisor import Supervisor, install_shutdown_handlers, terminate_all
     from utils.logger_manager import logger
+    from utils.status_store import StatusStore, status_db_path
 
     supervisor = Supervisor(args, mode, cookies)
+
+    # Honor pauses persisted by the web dashboard, but never create the status
+    # DB from a plain CLI run.
+    db = status_db_path(args.output)
+    if db.exists():
+        store = StatusStore(db)
+        try:
+            supervisor.preseed_stopped(store.paused_users())
+        finally:
+            store.close()
+
     supervisor.sync_users()
-    if not supervisor.processes:
+    if not supervisor.processes and not supervisor.stopped_users:
         logger.error("No users found in the users file to monitor.")
         return
 

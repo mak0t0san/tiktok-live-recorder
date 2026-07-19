@@ -19,6 +19,10 @@ class FakeResponse:
     def json(self):
         return self._data
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class FakeHttpClient:
     def __init__(self, responses):
@@ -270,103 +274,6 @@ def test_download_live_stream_closes_when_consumer_abandons_generator():
     gen.close()
 
     assert response.closed
-
-
-# -- following list -----------------------------------------------------------
-
-
-def _user_entry(unique_id, nickname=None, avatar=None):
-    user = {"uniqueId": unique_id}
-    if nickname:
-        user["nickname"] = nickname
-    if avatar:
-        user["avatarThumb"] = {"urlList": [avatar]}
-    return {"user": user}
-
-
-def _priming_response(ms_token="fresh-token"):
-    return FakeResponse({}, cookies={"msToken": ms_token} if ms_token else {})
-
-
-def test_get_following_returns_rich_entries_across_pages():
-    api = build_api(
-        _priming_response(),
-        {
-            "userList": [
-                _user_entry("alice", "Alice A", "http://cdn/alice.jpg"),
-                _user_entry("bob", "Bob B"),
-            ],
-            "hasMore": True,
-            "minCursor": 10,
-        },
-        {
-            "userList": [_user_entry("carol")],
-            "hasMore": False,
-            "minCursor": 20,
-        },
-    )
-
-    entries = api.get_following("sec-uid")
-
-    assert entries == [
-        {
-            "unique_id": "alice",
-            "nickname": "Alice A",
-            "avatar_url": "http://cdn/alice.jpg",
-        },
-        {"unique_id": "bob", "nickname": "Bob B", "avatar_url": None},
-        {"unique_id": "carol", "nickname": None, "avatar_url": None},
-    ]
-    # priming + two pages
-    assert len(api.http_client.urls) == 3
-    # pagination uses the harvested msToken, not the seed one
-    assert "msToken=fresh-token" in api.http_client.urls[1]
-
-
-def test_get_following_stops_when_cursor_repeats():
-    api = build_api(
-        _priming_response(),
-        {
-            "userList": [_user_entry("alice")],
-            "hasMore": True,
-            "minCursor": 0,  # cursor did not advance
-        },
-    )
-
-    entries = api.get_following("sec-uid")
-
-    assert [e["unique_id"] for e in entries] == ["alice"]
-    assert len(api.http_client.urls) == 2
-
-
-def test_get_following_missing_ms_token_raises_cookie_error():
-    api = build_api(_priming_response(ms_token=None))
-
-    with pytest.raises(TikTokRecorderError, match="cookies.json"):
-        api.get_following("sec-uid")
-
-
-def test_get_followers_list_still_returns_usernames():
-    api = build_api(
-        _priming_response(),
-        {
-            "userList": [_user_entry("alice", "Alice A"), _user_entry("bob")],
-            "hasMore": False,
-            "minCursor": 5,
-        },
-    )
-
-    assert api.get_followers_list("sec-uid") == ["alice", "bob"]
-
-
-def test_get_followers_list_raises_on_empty():
-    api = build_api(
-        _priming_response(),
-        {"userList": [], "hasMore": False, "minCursor": 0},
-    )
-
-    with pytest.raises(TikTokRecorderError, match="empty"):
-        api.get_followers_list("sec-uid")
 
 
 def test_get_user_details_parses_signed_response():

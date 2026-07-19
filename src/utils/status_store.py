@@ -45,6 +45,34 @@ CREATE TABLE IF NOT EXISTS profiles (
 )
 """
 
+# Per-user knobs that must survive restarts (currently just the pause flag).
+_USER_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_settings (
+    user TEXT PRIMARY KEY,
+    paused INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+)
+"""
+
+# One row per finished recording session; keyed by (user, started_at) so the
+# post-conversion re-write of the same session just updates the path.
+_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS recording_history (
+    user TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL NOT NULL,
+    duration REAL NOT NULL,
+    bytes_written INTEGER NOT NULL DEFAULT 0,
+    output_path TEXT,
+    PRIMARY KEY (user, started_at)
+)
+"""
+
+_HISTORY_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_history_user_ended
+ON recording_history(user, ended_at)
+"""
+
 
 def status_db_path(output_dir=None) -> Path:
     directory = Path(output_dir) if output_dir else Path.cwd()
@@ -61,6 +89,9 @@ class StatusStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
         self._conn.execute(_PROFILES_SCHEMA)
+        self._conn.execute(_USER_SETTINGS_SCHEMA)
+        self._conn.execute(_HISTORY_SCHEMA)
+        self._conn.execute(_HISTORY_INDEX)
         self._conn.commit()
 
     def close(self):
@@ -121,7 +152,63 @@ class StatusStore:
 
     def remove(self, user):
         self._conn.execute("DELETE FROM recordings WHERE user = ?", [user])
+        self._conn.execute("DELETE FROM user_settings WHERE user = ?", [user])
+        self._conn.execute("DELETE FROM recording_history WHERE user = ?", [user])
         self._conn.commit()
+
+    def set_paused(self, user, paused):
+        """Persist whether ``user``'s monitoring is paused."""
+        self._conn.execute(
+            "INSERT INTO user_settings (user, paused, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET "
+            "paused=excluded.paused, updated_at=excluded.updated_at",
+            [user, 1 if paused else 0, time.time()],
+        )
+        self._conn.commit()
+
+    def paused_users(self) -> set:
+        cursor = self._conn.execute("SELECT user FROM user_settings WHERE paused = 1")
+        return {row[0] for row in cursor.fetchall()}
+
+    def add_history(
+        self, user, *, started_at, ended_at, bytes_written=0, output_path=None
+    ):
+        """
+        Record a finished recording session. Idempotent per (user, started_at):
+        the recorder re-writes the same session after flv->mp4 conversion to
+        update the output path.
+        """
+        self._conn.execute(
+            "INSERT INTO recording_history "
+            "(user, started_at, ended_at, duration, bytes_written, output_path) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user, started_at) DO UPDATE SET "
+            "ended_at=excluded.ended_at, duration=excluded.duration, "
+            "bytes_written=excluded.bytes_written, "
+            "output_path=excluded.output_path",
+            [
+                user,
+                started_at,
+                ended_at,
+                max(0.0, ended_at - started_at),
+                bytes_written,
+                str(output_path) if output_path is not None else None,
+            ],
+        )
+        self._conn.commit()
+
+    def latest_history(self) -> dict:
+        """Most recent finished session per user, keyed by user."""
+        cursor = self._conn.execute(
+            "SELECT h.user, h.started_at, h.ended_at, h.duration, "
+            "h.bytes_written, h.output_path "
+            "FROM recording_history h "
+            "JOIN (SELECT user, MAX(ended_at) AS m FROM recording_history "
+            "GROUP BY user) x ON h.user = x.user AND h.ended_at = x.m"
+        )
+        names = [d[0] for d in cursor.description]
+        return {row[0]: dict(zip(names, row)) for row in cursor.fetchall()}
 
     def upsert_profile(
         self, user, *, nickname=None, avatar_url=None, avatar_fetched_at=None
@@ -192,9 +279,28 @@ class StatusReporter:
 
             logger.debug("Status write failed", exc_info=True)
 
+    def record_session(
+        self, *, started_at, ended_at=None, bytes_written=0, output_path=None
+    ):
+        try:
+            self._get_store().add_history(
+                self.user,
+                started_at=started_at,
+                ended_at=ended_at if ended_at is not None else time.time(),
+                bytes_written=bytes_written,
+                output_path=output_path,
+            )
+        except Exception:
+            from utils.logger_manager import logger
+
+            logger.debug("History write failed", exc_info=True)
+
 
 class NullStatusReporter:
     """Default reporter for plain CLI runs: does nothing."""
 
     def report(self, **fields):
+        pass
+
+    def record_session(self, **fields):
         pass

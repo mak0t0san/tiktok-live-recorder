@@ -35,7 +35,6 @@ class Mode(IntEnum):
 
     MANUAL = 0
     AUTOMATIC = 1
-    FOLLOWERS = 2
 
 
 class Error(Enum):
@@ -70,12 +69,6 @@ class TikTokError(Enum):
 
     COUNTRY_BLACKLISTED_AUTO_MODE = (
         "Automatic mode is available only in unblocked countries. "
-        "Use a VPN or authenticate with cookies.\n"
-        "How to set cookies: https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies\n"
-    )
-
-    COUNTRY_BLACKLISTED_FOLLOWERS_MODE = (
-        "Followers mode is available only in unblocked countries. "
         "Use a VPN or authenticate with cookies.\n"
         "How to set cookies: https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies\n"
     )

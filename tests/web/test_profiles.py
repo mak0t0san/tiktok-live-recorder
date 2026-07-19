@@ -126,45 +126,6 @@ def test_run_once_handles_unknown_user(tmp_path):
     assert _profiles(tmp_path)["alice"]["nickname"] is None
 
 
-def test_seed_stores_following_entries(tmp_path):
-    refresher = _refresher(tmp_path, FakeAPI())
-
-    refresher.seed(
-        [
-            {
-                "unique_id": "carol",
-                "nickname": "Carol C",
-                "avatar_url": "http://cdn/carol.jpg",
-            },
-            {"unique_id": None, "nickname": "ignored"},
-        ]
-    )
-
-    profiles = _profiles(tmp_path)
-    assert set(profiles) == {"carol"}
-    assert profiles["carol"]["nickname"] == "Carol C"
-
-
-def test_seeded_user_is_not_looked_up_again(tmp_path):
-    api = FakeAPI()
-    refresher = _refresher(tmp_path, api)
-    refresher.seed(
-        [
-            {
-                "unique_id": "alice",
-                "nickname": "Alice A",
-                "avatar_url": "http://cdn/alice.jpg",
-            }
-        ]
-    )
-
-    refresher.run_once()
-
-    assert api.lookups == []  # profile came from the seed
-    # but the avatar still gets mirrored to disk
-    assert (tmp_path / "avatars" / "alice.jpg").is_file()
-
-
 def test_pathlike_usernames_never_touch_disk(tmp_path):
     api = FakeAPI()
     refresher = _refresher(tmp_path, api, users=("alice",))

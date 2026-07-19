@@ -117,3 +117,114 @@ def test_profiles_keyed_by_user(store):
 
     profiles = store.profiles()
     assert set(profiles) == {"alice", "bob"}
+
+
+def test_set_paused_roundtrip(store):
+    assert store.paused_users() == set()
+
+    store.set_paused("alice", True)
+    store.set_paused("bob", True)
+    assert store.paused_users() == {"alice", "bob"}
+
+    store.set_paused("alice", False)
+    assert store.paused_users() == {"bob"}
+
+
+def test_add_history_upsert_is_idempotent(store):
+    store.add_history(
+        "alice", started_at=100.0, ended_at=200.0, bytes_written=10, output_path="a.flv"
+    )
+    store.add_history(
+        "alice", started_at=100.0, ended_at=205.0, bytes_written=20, output_path="a.mp4"
+    )
+
+    latest = store.latest_history()["alice"]
+    assert latest["started_at"] == 100.0
+    assert latest["ended_at"] == 205.0
+    assert latest["duration"] == 105.0
+    assert latest["bytes_written"] == 20
+    assert latest["output_path"] == "a.mp4"
+
+
+def test_latest_history_picks_newest_per_user(store):
+    store.add_history("alice", started_at=100.0, ended_at=200.0)
+    store.add_history("alice", started_at=300.0, ended_at=450.0)
+    store.add_history("bob", started_at=50.0, ended_at=60.0)
+
+    latest = store.latest_history()
+    assert latest["alice"]["ended_at"] == 450.0
+    assert latest["alice"]["duration"] == 150.0
+    assert latest["bob"]["ended_at"] == 60.0
+
+
+def test_remove_clears_settings_and_history(store):
+    store.update("alice", state="waiting")
+    store.set_paused("alice", True)
+    store.add_history("alice", started_at=1.0, ended_at=2.0)
+
+    store.remove("alice")
+
+    assert store.get("alice") is None
+    assert store.paused_users() == set()
+    assert store.latest_history() == {}
+
+
+def test_reopening_pre_feature_db_migrates(tmp_path):
+    import sqlite3
+
+    # simulate a DB created before user_settings/recording_history existed
+    db = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE recordings (user TEXT PRIMARY KEY, state TEXT NOT NULL, "
+        "pid INTEGER, room_id TEXT, output_path TEXT, "
+        "bytes_written INTEGER NOT NULL DEFAULT 0, started_at REAL, "
+        "updated_at REAL NOT NULL, error TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StatusStore(db)
+    try:
+        store.set_paused("alice", True)
+        store.add_history("alice", started_at=1.0, ended_at=2.0)
+        assert store.paused_users() == {"alice"}
+    finally:
+        store.close()
+
+
+def test_reporter_record_session_writes_history(tmp_path):
+    db = tmp_path / "status.sqlite3"
+    StatusReporter("alice", db).record_session(
+        started_at=100.0, ended_at=160.0, bytes_written=5, output_path="x.mp4"
+    )
+
+    store = StatusStore(db)
+    try:
+        latest = store.latest_history()["alice"]
+        assert latest["duration"] == 60.0
+        assert latest["output_path"] == "x.mp4"
+    finally:
+        store.close()
+
+
+def test_reporter_record_session_defaults_ended_at_to_now(tmp_path):
+    import time
+
+    db = tmp_path / "status.sqlite3"
+    before = time.time()
+    StatusReporter("alice", db).record_session(started_at=before - 10)
+
+    store = StatusStore(db)
+    try:
+        assert store.latest_history()["alice"]["ended_at"] >= before
+    finally:
+        store.close()
+
+
+def test_reporter_record_session_swallows_failures(tmp_path):
+    StatusReporter("alice", tmp_path).record_session(started_at=1.0)
+
+
+def test_null_reporter_record_session_is_a_noop():
+    NullStatusReporter().record_session(started_at=1.0)

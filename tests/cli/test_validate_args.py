@@ -26,16 +26,6 @@ def test_automatic_mode_valid_with_user(monkeypatch):
     assert mode == Mode.AUTOMATIC
 
 
-def test_followers_mode_valid_with_user(monkeypatch):
-    # User input is not required for followers mode
-    monkeypatch.setattr(
-        sys, "argv", ["tiktok-live-recorder", "-mode", "followers", "-user", "test"]
-    )
-    args, mode = validate_and_parse_args()
-    assert args.user == "test"
-    assert mode == Mode.FOLLOWERS
-
-
 def test_manual_mode_valid_without_user(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["tiktok-live-recorder", "-mode", "manual"])
     with pytest.raises(
@@ -54,20 +44,13 @@ def test_automatic_mode_valid_without_user(monkeypatch):
         validate_and_parse_args()
 
 
-def test_followers_mode_valid_without_user(monkeypatch):
-    # User input is not required for followers mode
-    monkeypatch.setattr(sys, "argv", ["tiktok-live-recorder", "-mode", "followers"])
-    _, mode = validate_and_parse_args()  # Should not raise an exception
-    assert mode == Mode.FOLLOWERS
-
-
 def test_unknown_mode(monkeypatch):
     monkeypatch.setattr(
         sys, "argv", ["tiktok-live-recorder", "-mode", "x", "-user", "test"]
     )
     with pytest.raises(
         ArgsParseError,
-        match="Incorrect mode value. Choose between 'manual', 'automatic' or 'followers'.",
+        match="Incorrect mode value. Choose between 'manual' or 'automatic'.",
     ):
         validate_and_parse_args()  # Should raise an ArgsParseError for unknown mode
 
@@ -329,11 +312,11 @@ def test_web_rejects_explicit_user(monkeypatch):
         validate_and_parse_args()
 
 
-def test_web_rejects_followers_mode(monkeypatch):
+def test_web_rejects_unsupported_mode(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["tiktok-live-recorder", "-web", "-mode", "followers"],
+        ["tiktok-live-recorder", "-web", "-mode", "x"],
     )
     with pytest.raises(ArgsParseError, match="-web only supports automatic mode"):
         validate_and_parse_args()

@@ -24,10 +24,6 @@ class FakeTikTokAPI:
         self.calls.append(f"get_user_from_room_id:{room_id}")
         return "creator"
 
-    def get_sec_uid(self):
-        self.calls.append("get_sec_uid")
-        return "sec_uid"
-
     def is_room_alive(self, room_id):
         self.calls.append(f"is_room_alive:{room_id}")
         return True
@@ -48,17 +44,6 @@ def test_setup_resolves_room_id_before_country_check_for_manual_user():
         "is_country_blacklisted",
         "is_room_alive:1234567890",
     ]
-
-
-def test_setup_keeps_followers_country_check_before_sec_uid():
-    recorder = TikTokRecorder(RecorderConfig(mode=Mode.FOLLOWERS, cookies={}))
-    fake_api = FakeTikTokAPI(blacklisted=True)
-    recorder.tiktok = fake_api
-
-    with pytest.raises(TikTokRecorderError, match="Captcha required"):
-        recorder._setup()
-
-    assert fake_api.calls == ["is_country_blacklisted"]
 
 
 def test_setup_keeps_automatic_mode_blocked_after_room_resolution():
@@ -157,7 +142,7 @@ def test_start_recording_finalizes_then_propagates_keyboard_interrupt(
     assert converted, "recording should be finalized/converted before re-raising"
 
 
-def _build_recorder(tmp_path, mode=Mode.FOLLOWERS):
+def _build_recorder(tmp_path, mode=Mode.AUTOMATIC):
     return TikTokRecorder(
         RecorderConfig(mode=mode, user="creator", cookies={}, output=str(tmp_path))
     )
@@ -321,44 +306,6 @@ def test_stale_404_url_does_not_retry_forever(tmp_path, monkeypatch):
     assert api.download_calls == 2
 
 
-def test_followers_mode_sets_stop_event_and_joins_on_interrupt(tmp_path):
-    recorder = _build_recorder(tmp_path)
-    recorder.sec_uid = "sec_uid"
-
-    class InterruptingAPI:
-        def get_followers_list(self, sec_uid):
-            raise KeyboardInterrupt()
-
-    recorder.tiktok = InterruptingAPI()
-
-    with pytest.raises(KeyboardInterrupt):
-        recorder.followers_mode()
-
-    assert recorder._stop_event.is_set()
-
-
-def test_shutdown_recordings_joins_alive_threads(tmp_path):
-    recorder = _build_recorder(tmp_path)
-
-    class FakeThread:
-        def __init__(self):
-            self.joined = []
-            self.alive = True
-
-        def is_alive(self):
-            return self.alive
-
-        def join(self, timeout=None):
-            self.joined.append(timeout)
-            self.alive = False
-
-    thread = FakeThread()
-    recorder._shutdown_recordings({"creator": thread})
-
-    assert recorder._stop_event.is_set()
-    assert thread.joined
-
-
 class FiniteStreamAPI:
     """Yields one large chunk, then the stream ends normally."""
 
@@ -457,3 +404,167 @@ def test_telegram_upload_skipped_when_interrupted(tmp_path, monkeypatch):
         recorder.start_recording("creator", "1234567890")
 
     assert uploads == []
+
+
+# -- wake event ("check now") ---------------------------------------------------
+
+
+def _timed_wait(recorder, seconds):
+    import time
+
+    start = time.monotonic()
+    result = recorder._wait_or_stop(seconds)
+    return result, time.monotonic() - start
+
+
+def test_wait_or_stop_without_wake_event_waits_on_stop(tmp_path):
+    recorder = _build_recorder(tmp_path)
+    assert recorder._wake_event is None
+
+    recorder._stop_event.set()
+    assert recorder._wait_or_stop(30) is True
+
+
+def test_wait_or_stop_wakes_early_on_wake_event(tmp_path):
+    import threading
+
+    wake = threading.Event()
+    recorder = TikTokRecorder(
+        RecorderConfig(
+            mode=Mode.AUTOMATIC,
+            user="creator",
+            cookies={},
+            output=str(tmp_path),
+            wake_event=wake,
+        )
+    )
+
+    threading.Timer(0.2, wake.set).start()
+    result, elapsed = _timed_wait(recorder, 30)
+
+    assert result is False  # not a stop: caller should re-check liveness
+    assert elapsed < 5
+    assert not wake.is_set()  # consumed
+
+
+def test_wait_or_stop_stop_wins_with_wake_event_present(tmp_path):
+    import threading
+
+    recorder = TikTokRecorder(
+        RecorderConfig(
+            mode=Mode.AUTOMATIC,
+            user="creator",
+            cookies={},
+            output=str(tmp_path),
+            wake_event=threading.Event(),
+        )
+    )
+    recorder._stop_event.set()
+
+    result, elapsed = _timed_wait(recorder, 30)
+    assert result is True
+    assert elapsed < 5
+
+
+def test_wait_or_stop_clears_stale_wake_on_entry(tmp_path):
+    import threading
+
+    wake = threading.Event()
+    wake.set()  # queued while the recorder was busy recording
+    recorder = TikTokRecorder(
+        RecorderConfig(
+            mode=Mode.AUTOMATIC,
+            user="creator",
+            cookies={},
+            output=str(tmp_path),
+            wake_event=wake,
+        )
+    )
+
+    result, elapsed = _timed_wait(recorder, 1.5)
+    assert result is False
+    assert elapsed >= 1.0  # stale wake did not short-circuit the sleep
+
+
+# -- recording history ----------------------------------------------------------
+
+
+class FakeReporter:
+    def __init__(self):
+        self.reports = []
+        self.sessions = []
+
+    def report(self, **fields):
+        self.reports.append(fields)
+
+    def record_session(self, **fields):
+        self.sessions.append(fields)
+
+
+def test_history_recorded_on_cooperative_stop(tmp_path, monkeypatch):
+    recorder = _build_recorder(tmp_path)
+    api = CooperativeStopAPI()
+    api.recorder = recorder
+    recorder.tiktok = api
+    recorder._status = FakeReporter()
+
+    monkeypatch.setattr(
+        VideoManagement,
+        "convert_flv_to_mp4",
+        lambda *args, **kwargs: str(tmp_path / "converted.mp4"),
+    )
+
+    recorder.start_recording("creator", "1234567890")
+
+    sessions = recorder._status.sessions
+    assert len(sessions) == 2  # raw write, then converted-path update
+    assert sessions[0]["bytes_written"] == 8192 + 100
+    assert sessions[0]["ended_at"] >= sessions[0]["started_at"]
+    assert sessions[1]["output_path"] == str(tmp_path / "converted.mp4")
+    assert sessions[1]["started_at"] == sessions[0]["started_at"]
+
+
+def test_history_recorded_once_when_conversion_fails(tmp_path, monkeypatch):
+    recorder = _build_recorder(tmp_path)
+    api = CooperativeStopAPI()
+    api.recorder = recorder
+    recorder.tiktok = api
+    recorder._status = FakeReporter()
+
+    monkeypatch.setattr(
+        VideoManagement, "convert_flv_to_mp4", lambda *args, **kwargs: None
+    )
+
+    recorder.start_recording("creator", "1234567890")
+
+    assert len(recorder._status.sessions) == 1
+
+
+def test_history_recorded_on_keyboard_interrupt(tmp_path, monkeypatch):
+    recorder = _build_recorder(tmp_path, mode=Mode.MANUAL)
+    recorder.tiktok = FakeStreamAPI()
+    recorder._status = FakeReporter()
+
+    monkeypatch.setattr(
+        VideoManagement, "convert_flv_to_mp4", lambda *args, **kwargs: None
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        recorder.start_recording("creator", "1234567890")
+
+    assert len(recorder._status.sessions) == 1
+
+
+def test_no_history_for_discarded_tiny_stream(tmp_path, monkeypatch):
+    recorder = _build_recorder(tmp_path)
+    recorder.tiktok = FakeStreamAPI()
+    recorder._stop_event.set()
+    recorder._status = FakeReporter()
+
+    monkeypatch.setattr(
+        VideoManagement, "convert_flv_to_mp4", lambda *args, **kwargs: None
+    )
+
+    recorder.start_recording("creator", "1234567890")
+
+    assert recorder._status.sessions == []

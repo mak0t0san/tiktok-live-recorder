@@ -26,14 +26,27 @@ function fmtBytes(n) {
   return `${(n / 2 ** (10 * i)).toFixed(i ? 1 : 0)} ${units[i]}`;
 }
 
-function fmtDuration(startedAt, now) {
-  if (!startedAt) return '';
-  const s = Math.max(0, Math.floor(now - startedAt));
+function fmtDurationSecs(s) {
+  s = Math.max(0, Math.floor(s || 0));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   return (h ? `${h}h ` : '') + `${m}m ${sec}s`;
 }
 
+function fmtDuration(startedAt, now) {
+  if (!startedAt) return '';
+  return fmtDurationSecs(now - startedAt);
+}
+
+function fmtAgo(ts, now) {
+  const s = Math.max(0, Math.floor(now - ts));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 function displayState(rec) {
+  if (rec.paused && !rec.alive) return 'paused';
   if (rec.stopped && !rec.alive) return 'stopped';
   if (!rec.alive && rec.state !== 'stopped') return rec.monitored ? 'restarting' : 'stale';
   return rec.state;
@@ -53,15 +66,21 @@ function cardHtml(rec, now) {
   const meta = [];
   if (state === 'recording') {
     meta.push(fmtDuration(rec.started_at, now), fmtBytes(rec.bytes_written));
+  } else if (rec.last_recorded_at) {
+    meta.push(`Last live: ${fmtAgo(rec.last_recorded_at, now)} · ${fmtDurationSecs(rec.last_duration)}`);
   }
   if (state === 'error' && rec.error) meta.push(esc(rec.error));
 
-  const stoppable = rec.alive && !rec.stopped;
-  const resumable = rec.stopped;
-  const previewable = rec.previewable && !rec.stopped;
+  const stoppable = rec.alive && !rec.paused;
+  const resumable = rec.paused || rec.stopped;
+  const previewable = rec.previewable && !rec.stopped && !rec.paused;
+  const checkable = state === 'waiting' && rec.alive && !rec.paused;
 
   const name = rec.nickname ? esc(rec.nickname) : `@${esc(rec.user)}`;
   const handle = rec.nickname ? `<div class="handle">@${esc(rec.user)}</div>` : '';
+  const chip = state === 'recording'
+    ? '<span class="chip recording"><span class="rec-dot"></span>recording</span>'
+    : `<span class="chip ${state}">${state}</span>`;
 
   return `
     <div class="row">
@@ -69,12 +88,13 @@ function cardHtml(rec, now) {
         ${avatarHtml(rec)}
         <div><h3>${name}</h3>${handle}</div>
       </div>
-      <span class="chip ${state}">${state}</span>
+      ${chip}
     </div>
     <p class="meta">${meta.join(' · ')}</p>
     <div class="actions">
       <button data-action="preview" ${previewable ? '' : 'disabled'}>
         ${activePreviews.has(rec.user) ? 'Hide preview' : 'Preview'}</button>
+      <button data-action="check" ${checkable ? '' : 'disabled'}>Check now</button>
       <button data-action="stop" ${stoppable ? '' : 'disabled'}>Stop</button>
       <button data-action="resume" ${resumable ? '' : 'hidden'}>Resume</button>
       <button data-action="remove" class="danger">Remove</button>
@@ -116,6 +136,16 @@ async function act(user, action, card) {
     refresh();
     return;
   }
+  if (action === 'check') {
+    const btn = card.querySelector('[data-action="check"]');
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    await api(`/api/recordings/${encodeURIComponent(user)}/check-now`, { method: 'POST' });
+    // The next 2s status poll rebuilds the card (and this button) with the
+    // outcome; no immediate refresh so "Checking…" stays visible briefly.
+    setTimeout(refresh, 500);
+    return;
+  }
   if (action === 'stop') {
     closePreview(user);
     await api(`/api/recordings/${encodeURIComponent(user)}/stop`, { method: 'POST' });
@@ -135,10 +165,27 @@ function renderGlobalControls(data) {
   pauseBtn.textContent = data.paused ? 'Resume monitoring' : 'Pause monitoring';
   document.getElementById('paused-banner').hidden = !data.paused;
 
-  const anyStoppable = data.recordings.some((r) => r.alive && !r.stopped);
-  const anyResumable = data.recordings.some((r) => r.stopped);
+  const anyStoppable = data.recordings.some((r) => r.alive && !r.paused);
+  const anyResumable = data.recordings.some((r) => r.paused || r.stopped);
   document.getElementById('stop-all').hidden = !anyStoppable;
   document.getElementById('resume-all').hidden = !anyResumable;
+}
+
+/* -- sorting --------------------------------------------------------------- */
+
+const STATUS_ORDER = {
+  recording: 0, converting: 1, uploading: 1, waiting: 2, starting: 2,
+  restarting: 2, paused: 3, stopped: 3, error: 4, stale: 4, unknown: 5,
+};
+
+function sortRecs(recs) {
+  const key = localStorage.getItem('tlr-sort') || 'status';
+  return [...recs].sort((a, b) => {
+    if (key === 'user') return a.user.localeCompare(b.user);
+    if (key === 'name') return (a.nickname || a.user).localeCompare(b.nickname || b.user);
+    const d = (STATUS_ORDER[displayState(a)] ?? 9) - (STATUS_ORDER[displayState(b)] ?? 9);
+    return d || a.user.localeCompare(b.user);
+  });
 }
 
 async function refresh() {
@@ -146,7 +193,8 @@ async function refresh() {
   const seen = new Set();
   renderGlobalControls(data);
 
-  for (const rec of data.recordings) {
+  const sorted = sortRecs(data.recordings);
+  for (const rec of sorted) {
     seen.add(rec.user);
     let card = cards.querySelector(`[data-user="${CSS.escape(rec.user)}"]`);
     if (!card) {
@@ -163,10 +211,25 @@ async function refresh() {
     card.innerHTML = cardHtml(rec, data.now);
     if (video && activePreviews.has(rec.user)) card.appendChild(video);
     else if (video) video.remove();
+
+    const st = displayState(rec);
+    card.classList.toggle('recording', st === 'recording');
+    card.classList.toggle('paused', st === 'paused' || st === 'stopped');
   }
 
   for (const card of [...cards.children]) {
     if (!seen.has(card.dataset.user)) { closePreview(card.dataset.user); card.remove(); }
+  }
+
+  // Reorder the DOM only when the order actually changed: moving a node with
+  // a playing <video> can hiccup playback.
+  const desired = sorted.map((r) => r.user);
+  const current = [...cards.children].map((c) => c.dataset.user);
+  if (desired.join('\n') !== current.join('\n')) {
+    for (const user of desired) {
+      const card = cards.querySelector(`[data-user="${CSS.escape(user)}"]`);
+      if (card) cards.appendChild(card);
+    }
   }
   document.getElementById('cards-empty').hidden = data.recordings.length > 0;
 }
@@ -179,10 +242,30 @@ async function refreshFiles() {
       <td>${esc(f.name)}${f.raw ? ' <span class="chip">raw</span>' : ''}</td>
       <td class="num">${fmtBytes(f.size)}</td>
       <td class="num">${new Date(f.mtime * 1000).toLocaleString()}</td>
-      <td><a href="/files/${encodeURIComponent(f.name)}" download>Download</a></td>
+      <td>
+        ${f.raw && f.convertible
+    ? `<button data-file-action="convert" data-file-name="${encodeURIComponent(f.name)}">Convert</button> `
+    : ''}
+        <a href="/files/${encodeURIComponent(f.name)}" download>Download</a>
+      </td>
     </tr>`).join('');
   document.getElementById('files-empty').hidden = data.files.length > 0;
 }
+
+document.getElementById('files').addEventListener('click', async (e) => {
+  const convertBtn = e.target.closest('button[data-file-action="convert"]');
+  if (!convertBtn) return;
+  const name = decodeURIComponent(convertBtn.dataset.fileName);
+  convertBtn.disabled = true;
+  const resp = await api(`/api/files/${encodeURIComponent(name)}/convert`, { method: 'POST' });
+  if (!resp.ok) {
+    convertBtn.disabled = false;
+    const body = await resp.json();
+    alert(body.detail || 'Could not convert file');
+    return;
+  }
+  await refreshFiles();
+});
 
 document.getElementById('add-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -222,71 +305,11 @@ document.getElementById('pause-toggle').addEventListener('click', async (e) => {
   refresh();
 });
 
-/* -- following picker ----------------------------------------------------- */
-
-const followingList = document.getElementById('following-list');
-const followingMsg = document.getElementById('following-msg');
-let followingLoaded = false;
-
-function followRowHtml(entry) {
-  const avatar = entry.avatar_url
-    ? `<img class="avatar" src="${esc(entry.avatar_url)}" alt=""
-        onerror="this.hidden=true">`
-    : `<div class="avatar avatar-fallback">${esc(entry.unique_id[0].toUpperCase())}</div>`;
-  const name = entry.nickname ? esc(entry.nickname) : `@${esc(entry.unique_id)}`;
-  return `
-    <div class="follow-row" data-user="${esc(entry.unique_id)}">
-      ${avatar}
-      <div class="who"><div>${name}</div>
-        <div class="handle">@${esc(entry.unique_id)}</div></div>
-      <button data-add="${esc(entry.unique_id)}" class="primary">Add</button>
-    </div>`;
-}
-
-async function loadFollowing(force = false) {
-  followingMsg.textContent = 'Loading… (the first fetch can take a while)';
-  followingList.innerHTML = '';
-  try {
-    const resp = await api(`/api/following${force ? '?refresh=1' : ''}`);
-    const data = await resp.json();
-    if (!resp.ok) {
-      followingMsg.textContent = data.detail || 'Could not load following list';
-      return;
-    }
-    followingLoaded = true;
-    followingList.innerHTML = data.following.map(followRowHtml).join('');
-    followingMsg.textContent = data.following.length
-      ? '' : 'Everyone you follow is already monitored.';
-  } catch (err) {
-    followingMsg.textContent = 'Could not load following list';
-  }
-}
-
-document.getElementById('following-section').addEventListener('toggle', (e) => {
-  if (e.target.open && !followingLoaded) loadFollowing();
-});
-
-document.getElementById('following-refresh').addEventListener('click', () => {
-  loadFollowing(true);
-});
-
-followingList.addEventListener('click', async (e) => {
-  const user = e.target.dataset?.add;
-  if (!user) return;
-  e.target.disabled = true;
-  const resp = await api('/api/users', {
-    method: 'POST', body: JSON.stringify({ user }),
-  });
-  if (resp.ok) {
-    followingList.querySelector(`[data-user="${CSS.escape(user)}"]`)?.remove();
-    if (!followingList.children.length) {
-      followingMsg.textContent = 'Everyone you follow is already monitored.';
-    }
-    refresh();
-  } else {
-    e.target.disabled = false;
-    alert((await resp.json()).detail || 'Could not add user');
-  }
+const sortSelect = document.getElementById('sort-select');
+sortSelect.value = localStorage.getItem('tlr-sort') || 'status';
+sortSelect.addEventListener('change', () => {
+  localStorage.setItem('tlr-sort', sortSelect.value);
+  refresh();
 });
 
 refresh();

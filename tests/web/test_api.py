@@ -54,28 +54,12 @@ class FakeSupervisor:
         self.calls.append(("unpause",))
         self.paused = False
 
+    def preseed_stopped(self, users):
+        self.calls.append(("preseed_stopped", tuple(users)))
 
-class FakeTikTokAPI:
-    """Stands in for TikTokAPI in /api/following tests."""
-
-    fetches = 0
-
-    def __init__(self, following=None, error=None):
-        self.following = following or []
-        self.error = error
-        self.closed = False
-
-    def get_sec_uid(self):
-        return "sec-uid"
-
-    def get_following(self, sec_uid):
-        type(self).fetches += 1
-        if self.error is not None:
-            raise self.error
-        return self.following
-
-    def close(self):
-        self.closed = True
+    def check_now(self, user):
+        self.calls.append(("check_now", user))
+        return user in self.procs
 
 
 @pytest.fixture
@@ -203,19 +187,192 @@ def test_stop_unknown_user_404(env):
     assert client.post("/api/recordings/ghost/stop").status_code == 404
 
 
+def _paused_users(status_db):
+    store = StatusStore(status_db)
+    try:
+        return store.paused_users()
+    finally:
+        store.close()
+
+
+def test_stop_persists_pause_and_resume_clears_it(env):
+    client, _, _, _, status_db = env
+
+    client.post("/api/recordings/alice/stop")
+    assert _paused_users(status_db) == {"alice"}
+    by_user = {e["user"]: e for e in client.get("/api/status").json()["recordings"]}
+    assert by_user["alice"]["paused"] is True
+    assert by_user["bob"]["paused"] is False
+
+    client.post("/api/recordings/alice/resume")
+    assert _paused_users(status_db) == set()
+    by_user = {e["user"]: e for e in client.get("/api/status").json()["recordings"]}
+    assert by_user["alice"]["paused"] is False
+
+
+def test_stop_user_without_process_still_persists(env):
+    client, supervisor, users_file, _, status_db = env
+    users_file.write_text("alice\nbob\ncarol\n")
+
+    # carol is in the users file but has no process (e.g. paused at startup)
+    resp = client.post("/api/recordings/carol/stop")
+    assert resp.status_code == 200
+    assert _paused_users(status_db) == {"carol"}
+    assert ("preseed_stopped", ("carol",)) in supervisor.calls
+
+
+def test_stop_all_and_resume_all_persist_pause(env):
+    client, _, _, _, status_db = env
+
+    client.post("/api/recordings/stop-all")
+    assert _paused_users(status_db) == {"alice", "bob"}
+
+    client.post("/api/recordings/resume-all")
+    assert _paused_users(status_db) == set()
+
+
+def test_delete_user_clears_persisted_state(env):
+    client, _, _, _, status_db = env
+
+    store = StatusStore(status_db)
+    store.set_paused("bob", True)
+    store.add_history("bob", started_at=1.0, ended_at=2.0)
+    store.close()
+
+    client.delete("/api/users/bob")
+
+    store = StatusStore(status_db)
+    try:
+        assert store.paused_users() == set()
+        assert store.latest_history() == {}
+    finally:
+        store.close()
+
+
+def test_check_now_endpoint(env):
+    client, supervisor, _, _, _ = env
+
+    resp = client.post("/api/recordings/alice/check-now")
+    assert resp.status_code == 200
+    assert ("check_now", "alice") in supervisor.calls
+
+    assert client.post("/api/recordings/ghost/check-now").status_code == 409
+
+
+def test_status_includes_last_recording_history(env):
+    client, _, _, _, status_db = env
+
+    store = StatusStore(status_db)
+    store.add_history("alice", started_at=100.0, ended_at=160.0, bytes_written=9)
+    store.close()
+
+    by_user = {e["user"]: e for e in client.get("/api/status").json()["recordings"]}
+    assert by_user["alice"]["last_recorded_at"] == 160.0
+    assert by_user["alice"]["last_duration"] == 60.0
+    assert by_user["bob"]["last_recorded_at"] is None
+    assert by_user["bob"]["last_duration"] is None
+
+
 def test_files_listing_and_download(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir, status_db = env
     (output_dir / "TK_alice_2026.07.17_10-00-00.mp4").write_bytes(b"video")
     (output_dir / "TK_bob_2026.07.17_10-00-00_flv.mp4").write_bytes(b"raw")
+    active_raw = output_dir / "TK_carol_2026.07.17_10-00-00_flv.mp4"
+    active_raw.write_bytes(b"raw-active")
+
+    store = StatusStore(status_db)
+    store.update(
+        "carol",
+        state="recording",
+        pid=os.getpid(),
+        output_path=str(active_raw),
+        bytes_written=1024,
+    )
+    store.close()
 
     files = client.get("/api/files").json()["files"]
     by_name = {f["name"]: f for f in files}
     assert by_name["TK_alice_2026.07.17_10-00-00.mp4"]["raw"] is False
+    assert by_name["TK_alice_2026.07.17_10-00-00.mp4"]["convertible"] is False
     assert by_name["TK_bob_2026.07.17_10-00-00_flv.mp4"]["raw"] is True
+    assert by_name["TK_bob_2026.07.17_10-00-00_flv.mp4"]["convertible"] is True
+    assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["raw"] is True
+    assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["convertible"] is False
 
     resp = client.get("/files/TK_alice_2026.07.17_10-00-00.mp4")
     assert resp.status_code == 200
     assert resp.content == b"video"
+
+
+def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    status_db = tmp_path / "status.sqlite3"
+    raw = output_dir / "TK_alice_2026.07.17_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    called = {}
+
+    def _fake_convert(file, bitrate=None, ffmpeg_path=None):
+        called["file"] = file
+        called["ffmpeg_path"] = ffmpeg_path
+        converted = str(Path(file).with_name("TK_alice_2026.07.17_10-00-00.mp4"))
+        Path(converted).write_bytes(b"converted")
+        Path(file).unlink()
+        return converted
+
+    monkeypatch.setattr("web.app.VideoManagement.convert_flv_to_mp4", _fake_convert)
+
+    app = create_app(
+        supervisor=FakeSupervisor(),
+        users_file=users_file,
+        output_dir=output_dir,
+        auth=SessionAuth(PASSWORD),
+        status_db=status_db,
+        ffmpeg_path="/custom/ffmpeg",
+    )
+    client = TestClient(app)
+    client.post("/api/login", json={"password": PASSWORD})
+
+    resp = client.post(f"/api/files/{raw.name}/convert")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "name": "TK_alice_2026.07.17_10-00-00.mp4"}
+    assert called["file"] == str(raw)
+    assert called["ffmpeg_path"] == "/custom/ffmpeg"
+    assert not raw.exists()
+    assert (output_dir / "TK_alice_2026.07.17_10-00-00.mp4").is_file()
+
+
+def test_convert_rejects_non_raw_file(env):
+    client, _, _, output_dir, _ = env
+    file = output_dir / "TK_alice_2026.07.17_10-00-00.mp4"
+    file.write_bytes(b"video")
+
+    resp = client.post(f"/api/files/{file.name}/convert")
+    assert resp.status_code == 409
+    assert "Only raw" in resp.json()["detail"]
+
+
+def test_convert_rejects_active_raw_file(env):
+    client, _, _, output_dir, status_db = env
+    raw = output_dir / "TK_alice_2026.07.17_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    store = StatusStore(status_db)
+    store.update(
+        "alice",
+        state="recording",
+        pid=os.getpid(),
+        output_path=str(raw),
+        bytes_written=10,
+    )
+    store.close()
+
+    resp = client.post(f"/api/files/{raw.name}/convert")
+    assert resp.status_code == 409
+    assert "still being recorded or converted" in resp.json()["detail"]
 
 
 def test_download_blocks_path_traversal(env):
@@ -305,76 +462,3 @@ def test_avatar_blocks_path_traversal(env):
 
     assert client.get("/api/avatar/..%2Fsecret").status_code == 404
     assert client.get("/api/avatar/%2e%2e%2fsecret").status_code == 404
-
-
-# -- following picker -----------------------------------------------------------
-
-
-def _following_app(tmp_path, api_factory):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("alice\n")
-    app = create_app(
-        supervisor=FakeSupervisor(),
-        users_file=users_file,
-        output_dir=tmp_path,
-        auth=SessionAuth(PASSWORD),
-        status_db=tmp_path / "status.sqlite3",
-        api_factory=api_factory,
-    )
-    client = TestClient(app)
-    client.post("/api/login", json={"password": PASSWORD})
-    return client, users_file
-
-
-def _entry(user, nickname=None):
-    return {"unique_id": user, "nickname": nickname, "avatar_url": None}
-
-
-def test_following_unavailable_without_factory(env):
-    client, _, _, _, _ = env
-    assert client.get("/api/following").status_code == 503
-
-
-def test_following_filters_out_listed_users(tmp_path):
-    FakeTikTokAPI.fetches = 0
-    api = FakeTikTokAPI(following=[_entry("alice"), _entry("carol", "Carol C")])
-    client, _ = _following_app(tmp_path, lambda: api)
-
-    data = client.get("/api/following").json()
-
-    assert [e["unique_id"] for e in data["following"]] == ["carol"]
-    assert api.closed
-
-
-def test_following_uses_cache_until_refresh(tmp_path):
-    FakeTikTokAPI.fetches = 0
-    client, users_file = _following_app(
-        tmp_path, lambda: FakeTikTokAPI(following=[_entry("carol"), _entry("dave")])
-    )
-
-    client.get("/api/following")
-    client.get("/api/following")
-    assert FakeTikTokAPI.fetches == 1
-
-    client.get("/api/following?refresh=1")
-    assert FakeTikTokAPI.fetches == 2
-
-    # a just-added user disappears without a refetch
-    client.post("/api/users", json={"user": "carol"})
-    data = client.get("/api/following").json()
-    assert [e["unique_id"] for e in data["following"]] == ["dave"]
-    assert FakeTikTokAPI.fetches == 2
-
-
-def test_following_api_error_becomes_502(tmp_path):
-    from utils.custom_exceptions import TikTokRecorderError
-
-    FakeTikTokAPI.fetches = 0
-    client, _ = _following_app(
-        tmp_path,
-        lambda: FakeTikTokAPI(error=TikTokRecorderError("session expired")),
-    )
-
-    resp = client.get("/api/following")
-    assert resp.status_code == 502
-    assert "session expired" in resp.json()["detail"]

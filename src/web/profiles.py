@@ -55,26 +55,6 @@ class ProfileRefresher:
     def avatar_path(self, user: str) -> Path:
         return self.cache_dir / f"{user}.jpg"
 
-    def seed(self, entries):
-        """
-        Store profile data that arrived for free (e.g. from a following-list
-        fetch) so the refresher never has to look those users up itself.
-        """
-        if not entries:
-            return
-        store = StatusStore(self.status_db)
-        try:
-            for entry in entries:
-                user = entry.get("unique_id")
-                if user:
-                    store.upsert_profile(
-                        user,
-                        nickname=entry.get("nickname"),
-                        avatar_url=entry.get("avatar_url"),
-                    )
-        finally:
-            store.close()
-
     def run_once(self):
         """One refresh pass; extracted from the thread loop for testability."""
         try:

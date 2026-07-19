@@ -34,7 +34,9 @@ def record_user(config):
             )
 
 
-def build_config(args, mode, cookies, user=None, stop_event=None, status_db=None):
+def build_config(
+    args, mode, cookies, user=None, stop_event=None, status_db=None, wake_event=None
+):
     return RecorderConfig(
         url=args.url,
         user=user,
@@ -50,6 +52,7 @@ def build_config(args, mode, cookies, user=None, stop_event=None, status_db=None
         ffmpeg_path=args.ffmpeg_path,
         stop_event=stop_event,
         status_db=status_db,
+        wake_event=wake_event,
     )
 
 
@@ -129,6 +132,7 @@ class Supervisor:
         self.status_db = str(status_db) if status_db else None
         self.processes = {}  # user -> Process
         self.stop_events = {}  # user -> multiprocessing.Event
+        self.wake_events = {}  # user -> multiprocessing.Event ("check now")
         self.stopped_users = set()  # stopped via stop_user(); excluded from restart
         self.paused = False  # global pause: no starts/restarts while set
         self._restart_state = {}  # user -> {"count", "next_allowed", "started"}
@@ -137,6 +141,7 @@ class Supervisor:
     def start_user(self, user):
         with self._lock:
             stop_event = multiprocessing.Event()
+            wake_event = multiprocessing.Event()
             config = build_config(
                 self.args,
                 self.mode,
@@ -144,16 +149,26 @@ class Supervisor:
                 user=user,
                 stop_event=stop_event,
                 status_db=self.status_db,
+                wake_event=wake_event,
             )
             p = multiprocessing.Process(target=record_user, args=(config,))
             p.start()
             self.processes[user] = p
             self.stop_events[user] = stop_event
+            self.wake_events[user] = wake_event
             self.stopped_users.discard(user)
             state = self._restart_state.setdefault(
                 user, {"count": 0, "next_allowed": 0.0, "started": 0.0}
             )
             state["started"] = time.time()
+
+    def preseed_stopped(self, users):
+        """
+        Mark users as stopped before the first sync_users, so pauses persisted
+        in the status DB survive a restart without ever spawning a process.
+        """
+        with self._lock:
+            self.stopped_users |= set(users)
 
     def stop_user(self, user, force=False):
         """
@@ -254,6 +269,7 @@ class Supervisor:
         with self._lock:
             p = self.processes.pop(user, None)
             self.stop_events.pop(user, None)
+            self.wake_events.pop(user, None)
             self._restart_state.pop(user, None)
             self.stopped_users.discard(user)
         if p is None:
@@ -320,6 +336,22 @@ class Supervisor:
                 )
                 self.start_user(user)
                 logger.info(f"Restarted monitoring @{user}")
+
+    def check_now(self, user):
+        """
+        Ask ``user``'s recorder to re-check liveness immediately instead of
+        waiting out the automatic-mode interval. Returns False when the user
+        is paused, stopped, or has no live process.
+        """
+        with self._lock:
+            if self.paused or user in self.stopped_users:
+                return False
+            p = self.processes.get(user)
+            event = self.wake_events.get(user)
+            if p is None or not p.is_alive() or event is None:
+                return False
+            event.set()
+            return True
 
     def snapshot(self):
         """Per-user process view for the web dashboard."""
