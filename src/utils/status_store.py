@@ -54,6 +54,20 @@ CREATE TABLE IF NOT EXISTS user_settings (
 )
 """
 
+# Global (not per-user) dashboard settings, as a simple key/value bucket so
+# the dashboard can persist toggles that must survive a restart.
+_APP_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at REAL NOT NULL
+)
+"""
+
+# Whether NEW recordings are re-encoded onto a single consistent resolution
+# (the -scale feature), toggled globally from the dashboard.
+SCALE_SETTING = "normalize_size"
+
 # One row per finished recording session; keyed by (user, started_at) so the
 # post-conversion re-write of the same session just updates the path.
 _HISTORY_SCHEMA = """
@@ -90,6 +104,7 @@ class StatusStore:
         self._conn.execute(_SCHEMA)
         self._conn.execute(_PROFILES_SCHEMA)
         self._conn.execute(_USER_SETTINGS_SCHEMA)
+        self._conn.execute(_APP_SETTINGS_SCHEMA)
         self._conn.execute(_HISTORY_SCHEMA)
         self._conn.execute(_HISTORY_INDEX)
         self._conn.commit()
@@ -170,6 +185,34 @@ class StatusStore:
     def paused_users(self) -> set:
         cursor = self._conn.execute("SELECT user FROM user_settings WHERE paused = 1")
         return {row[0] for row in cursor.fetchall()}
+
+    def set_setting(self, key, value):
+        """Persist a global dashboard setting (value stored as text)."""
+        self._conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=excluded.value, updated_at=excluded.updated_at",
+            [key, None if value is None else str(value), time.time()],
+        )
+        self._conn.commit()
+
+    def get_setting(self, key, default=None):
+        cursor = self._conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?", [key]
+        )
+        row = cursor.fetchone()
+        return row[0] if row is not None else default
+
+    def set_scale(self, enabled):
+        """Persist whether new recordings are re-encoded to one resolution."""
+        self.set_setting(SCALE_SETTING, "1" if enabled else "0")
+
+    def scale_enabled(self, default=False) -> bool:
+        value = self.get_setting(SCALE_SETTING)
+        if value is None:
+            return default
+        return value == "1"
 
     def add_history(
         self, user, *, started_at, ended_at, bytes_written=0, output_path=None

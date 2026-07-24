@@ -130,6 +130,30 @@ def test_set_paused_roundtrip(store):
     assert store.paused_users() == {"bob"}
 
 
+def test_setting_roundtrip_and_default(store):
+    assert store.get_setting("missing") is None
+    assert store.get_setting("missing", "fallback") == "fallback"
+
+    store.set_setting("greeting", "hi")
+    assert store.get_setting("greeting") == "hi"
+
+    store.set_setting("greeting", "bye")
+    assert store.get_setting("greeting") == "bye"
+
+
+def test_scale_setting_roundtrip(store):
+    # unset: falls back to the caller-supplied default
+    assert store.scale_enabled() is False
+    assert store.scale_enabled(default=True) is True
+
+    store.set_scale(True)
+    assert store.scale_enabled() is True
+    assert store.scale_enabled(default=False) is True  # stored value wins
+
+    store.set_scale(False)
+    assert store.scale_enabled(default=True) is False
+
+
 def test_add_history_upsert_is_idempotent(store):
     store.add_history(
         "alice", started_at=100.0, ended_at=200.0, bytes_written=10, output_path="a.flv"

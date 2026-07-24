@@ -81,7 +81,13 @@
     background: #4a3a15; color: #ffd98a; border-radius: 8px;
     padding: .55rem .8rem; font-size: .85rem; margin-bottom: 1rem;
   }
-  video { width: 100%; border-radius: 8px; margin-top: .6rem; background: #000; aspect-ratio: 9 / 12; }
+  .preview { margin-top: .6rem; }
+  .preview video { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 9 / 12; display: block; }
+  .preview-msg {
+    border-radius: 8px; background: #1a1a22; color: #9aa; aspect-ratio: 9 / 12;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 1rem; font-size: .85rem; line-height: 1.4;
+  }
   table { width: 100%; border-collapse: collapse; font-size: .88rem; }
   th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #24242e; overflow-wrap: anywhere; }
   th { color: #9aa; font-weight: 500; }
@@ -94,7 +100,10 @@
 <body>
 <header>
   <h1>🎥 TikTok Live Recorder</h1>
-  <div style="display:flex; gap:.5rem">
+  <div style="display:flex; gap:.5rem; align-items:center">
+    <label id="scale-toggle-label" title="Re-encode NEW recordings onto a single consistent resolution so TikTok's mid-stream size changes no longer make playback shrink and grow. Slower and slightly lossy; does not affect recordings already in progress." style="display:flex; gap:.35rem; align-items:center; font-size:.85rem; cursor:pointer">
+      <input type="checkbox" id="scale-toggle"> Normalize size
+    </label>
     <button id="pause-toggle" hidden>Pause monitoring</button>
     <button id="logout">Log out</button>
   </div>

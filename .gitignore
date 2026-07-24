@@ -150,5 +150,5 @@ dmypy.json
 .tlr-avatar-cache/
 
 users.txt
-
+src/cookies.json
 recordings/

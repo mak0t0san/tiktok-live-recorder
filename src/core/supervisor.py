@@ -35,7 +35,14 @@ def record_user(config):
 
 
 def build_config(
-    args, mode, cookies, user=None, stop_event=None, status_db=None, wake_event=None
+    args,
+    mode,
+    cookies,
+    user=None,
+    stop_event=None,
+    status_db=None,
+    wake_event=None,
+    scale=None,
 ):
     return RecorderConfig(
         url=args.url,
@@ -49,6 +56,7 @@ def build_config(
         duration=args.duration,
         use_telegram=args.telegram,
         bitrate=args.bitrate,
+        scale=args.scale if scale is None else scale,
         ffmpeg_path=args.ffmpeg_path,
         stop_event=stop_event,
         status_db=status_db,
@@ -135,6 +143,21 @@ class Supervisor:
         self.wake_events = {}  # user -> multiprocessing.Event ("check now")
         self.stopped_users = set()  # stopped via stop_user(); excluded from restart
         self.paused = False  # global pause: no starts/restarts while set
+        # Whether NEW recordings re-encode to one consistent resolution. Seeded
+        # from the CLI -scale default, then overridden by any dashboard toggle
+        # persisted in the status DB so the choice survives a restart.
+        self.scale = bool(getattr(args, "scale", False))
+        if self.status_db:
+            try:
+                from utils.status_store import StatusStore
+
+                store = StatusStore(self.status_db)
+                try:
+                    self.scale = store.scale_enabled(default=self.scale)
+                finally:
+                    store.close()
+            except Exception:
+                logger.debug("Could not load scale setting", exc_info=True)
         self._restart_state = {}  # user -> {"count", "next_allowed", "started"}
         self._lock = threading.RLock()
 
@@ -150,6 +173,7 @@ class Supervisor:
                 stop_event=stop_event,
                 status_db=self.status_db,
                 wake_event=wake_event,
+                scale=self.scale,
             )
             p = multiprocessing.Process(target=record_user, args=(config,))
             p.start()
@@ -263,6 +287,34 @@ class Supervisor:
                     self._restart_state.pop(user, None)
         logger.info("Monitoring resumed")
         self.sync_users()
+
+    def set_scale(self, enabled):
+        """
+        Set whether NEW recordings are re-encoded onto a single consistent
+        resolution (removing TikTok's mid-stream size jumps on playback).
+
+        Applies only to recordings started after this call; in-flight
+        recordings keep the setting they were spawned with. Persisted to the
+        status DB so the choice survives a restart.
+        """
+        enabled = bool(enabled)
+        with self._lock:
+            self.scale = enabled
+        if self.status_db:
+            try:
+                from utils.status_store import StatusStore
+
+                store = StatusStore(self.status_db)
+                try:
+                    store.set_scale(enabled)
+                finally:
+                    store.close()
+            except Exception:
+                logger.debug("Could not persist scale setting", exc_info=True)
+        logger.info(
+            "Size normalization for new recordings "
+            + ("enabled" if enabled else "disabled")
+        )
 
     def remove_user(self, user, reason="removed from users file"):
         """Stop monitoring ``user`` entirely and forget its state."""

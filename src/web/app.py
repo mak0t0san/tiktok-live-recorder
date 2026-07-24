@@ -38,6 +38,10 @@ class StopBody(BaseModel):
     force: bool = False
 
 
+class SettingsBody(BaseModel):
+    scale: bool
+
+
 def create_app(
     *,
     supervisor,
@@ -149,6 +153,7 @@ def create_app(
         return {
             "now": time.time(),
             "paused": bool(getattr(supervisor, "paused", False)),
+            "scale": bool(getattr(supervisor, "scale", False)),
             "recordings": entries,
         }
 
@@ -226,6 +231,17 @@ def create_app(
         supervisor.unpause()
         return {"ok": True, "paused": False}
 
+    # -- settings -----------------------------------------------------------
+
+    @app.get("/api/settings")
+    def get_settings():
+        return {"scale": bool(getattr(supervisor, "scale", False))}
+
+    @app.post("/api/settings")
+    def update_settings(body: SettingsBody):
+        supervisor.set_scale(body.scale)
+        return {"ok": True, "scale": body.scale}
+
     @app.post("/api/recordings/{user}/stop")
     def stop_recording(user: str, body: StopBody | None = None):
         # Keyed on the users file (not on a live process) so a user paused at
@@ -298,7 +314,7 @@ def create_app(
         return {"files": files}
 
     @app.post("/api/files/{name}/convert")
-    def convert_file(name: str):
+    def convert_file(name: str, scale: bool = False):
         target = (output_dir / name).resolve()
         if target.parent != output_dir.resolve() or target.suffix != ".mp4":
             return JSONResponse({"detail": "Not found"}, status_code=404)
@@ -317,7 +333,7 @@ def create_app(
             )
 
         converted = VideoManagement.convert_flv_to_mp4(
-            str(target), ffmpeg_path=ffmpeg_path
+            str(target), ffmpeg_path=ffmpeg_path, scale=scale
         )
         if not converted:
             return JSONResponse({"detail": "Conversion failed"}, status_code=500)

@@ -2,7 +2,20 @@
  * drives per-user actions (stop / resume / remove / HLS preview). */
 
 const cards = document.getElementById('cards');
-const activePreviews = new Map(); // user -> { hls, video }
+// user -> { hls, video, el, watchdog, retries, mediaRecoveries, lastTime,
+//           stalledSince, failed }
+const activePreviews = new Map();
+
+// A fresh preview replays the whole on-disk FLV backlog into ffmpeg at disk
+// speed before converging on the live edge, so early manifest/segment requests
+// transiently 404. Absorb that with a bounded retry budget rather than letting
+// hls.js give up on the first fatal error (which leaves a spinner stuck at 0:00).
+const PREVIEW_MAX_RETRIES = 15;
+const PREVIEW_MAX_MEDIA_RECOVERIES = 2;
+const PREVIEW_STALL_MS = 10000; // reload if playback freezes this long mid-stream
+const PREVIEW_UNAVAILABLE =
+  'Preview unavailable — the stream may be starting up or using an '
+  + 'unsupported codec. Try again in a moment.';
 
 async function api(path, options = {}) {
   const resp = await fetch(path, {
@@ -105,28 +118,106 @@ function cardHtml(rec, now) {
 function closePreview(user) {
   const p = activePreviews.get(user);
   if (!p) return;
+  if (p.watchdog) clearInterval(p.watchdog);
   if (p.hls) p.hls.destroy();
-  p.video.remove();
+  p.el.remove();
   activePreviews.delete(user);
 }
 
+// Give up on a preview: stop loading and replace the player with a message.
+// The entry stays in activePreviews so the card keeps a "Hide preview" toggle
+// and refresh() keeps re-appending the message across status polls.
+function failPreview(user, message) {
+  const p = activePreviews.get(user);
+  if (!p || p.failed) return;
+  p.failed = true;
+  if (p.watchdog) { clearInterval(p.watchdog); p.watchdog = null; }
+  if (p.hls) { p.hls.destroy(); p.hls = null; }
+  p.el.textContent = '';
+  const msg = document.createElement('div');
+  msg.className = 'preview-msg';
+  msg.textContent = message;
+  p.el.appendChild(msg);
+}
+
 function openPreview(user, card) {
+  const el = document.createElement('div');
+  el.className = 'preview';
   const video = document.createElement('video');
   video.controls = true;
   video.muted = true;
   video.autoplay = true;
-  card.appendChild(video);
+  video.playsInline = true;
+  el.appendChild(video);
+  card.appendChild(el);
 
   const src = `/preview/${encodeURIComponent(user)}/index.m3u8`;
-  let hls = null;
+  const entry = {
+    hls: null, video, el, watchdog: null,
+    retries: 0, mediaRecoveries: 0, lastTime: 0, stalledSince: 0, failed: false,
+  };
+  activePreviews.set(user, entry);
+
+  const reload = () => {
+    if (entry.failed) return;
+    if (entry.hls) entry.hls.startLoad();
+    else { video.src = src; video.load(); }
+  };
+
   if (window.Hls && Hls.isSupported()) {
-    hls = new Hls({ liveSyncDurationCount: 2 });
+    const hls = new Hls({
+      liveSyncDurationCount: 2,
+      manifestLoadingMaxRetry: 6,
+      fragLoadingMaxRetry: 6,
+    });
+    entry.hls = hls;
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data.fatal || entry.failed) return; // hls.js recovers non-fatal itself
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        // Manifest/segment 404 while ffmpeg catches up: resume loading, bounded.
+        if (entry.retries++ < PREVIEW_MAX_RETRIES) setTimeout(reload, 1000);
+        else failPreview(user, PREVIEW_UNAVAILABLE);
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        if (entry.mediaRecoveries++ < PREVIEW_MAX_MEDIA_RECOVERIES) {
+          hls.recoverMediaError();
+        } else {
+          failPreview(user, PREVIEW_UNAVAILABLE);
+        }
+      } else {
+        failPreview(user, PREVIEW_UNAVAILABLE);
+      }
+    });
+    hls.on(Hls.Events.FRAG_LOADED, () => { entry.retries = 0; }); // healthy again
     hls.loadSource(src);
     hls.attachMedia(video);
   } else {
     video.src = src; // Safari plays HLS natively
+    video.addEventListener('error', () => {
+      if (entry.failed) return;
+      if (entry.retries++ < PREVIEW_MAX_RETRIES) setTimeout(reload, 1000);
+      else failPreview(user, PREVIEW_UNAVAILABLE);
+    });
   }
-  activePreviews.set(user, { hls, video });
+
+  // Watchdog: catch a mid-playback freeze that fires no hls.js error (currentTime
+  // stuck while the player is trying to play). User pauses and pre-roll are
+  // excluded via video.paused, so this only fights genuine stalls.
+  entry.watchdog = setInterval(() => {
+    if (entry.failed) return;
+    const t = video.currentTime;
+    if (video.paused || video.ended || t > entry.lastTime + 0.05) {
+      entry.lastTime = t;
+      entry.stalledSince = 0;
+      return;
+    }
+    const now = Date.now();
+    if (!entry.stalledSince) { entry.stalledSince = now; return; }
+    if (now - entry.stalledSince >= PREVIEW_STALL_MS) {
+      entry.stalledSince = 0;
+      if (entry.retries++ < PREVIEW_MAX_RETRIES) reload();
+      else failPreview(user, PREVIEW_UNAVAILABLE);
+    }
+  }, 2000);
 }
 
 async function act(user, action, card) {
@@ -169,6 +260,12 @@ function renderGlobalControls(data) {
   const anyResumable = data.recordings.some((r) => r.paused || r.stopped);
   document.getElementById('stop-all').hidden = !anyStoppable;
   document.getElementById('resume-all').hidden = !anyResumable;
+
+  // Don't clobber the checkbox while the user is mid-toggle (request in flight).
+  const scaleToggle = document.getElementById('scale-toggle');
+  if (!scaleToggle.dataset.pending) {
+    scaleToggle.checked = !!data.scale;
+  }
 }
 
 /* -- sorting --------------------------------------------------------------- */
@@ -207,10 +304,9 @@ async function refresh() {
       });
       cards.appendChild(card);
     }
-    const video = card.querySelector('video');
+    const preview = activePreviews.get(rec.user);
     card.innerHTML = cardHtml(rec, data.now);
-    if (video && activePreviews.has(rec.user)) card.appendChild(video);
-    else if (video) video.remove();
+    if (preview) card.appendChild(preview.el);
 
     const st = displayState(rec);
     card.classList.toggle('recording', st === 'recording');
@@ -245,6 +341,7 @@ async function refreshFiles() {
       <td>
         ${f.raw && f.convertible
     ? `<button data-file-action="convert" data-file-name="${encodeURIComponent(f.name)}">Convert</button> `
+      + `<button data-file-action="convert-scaled" data-file-name="${encodeURIComponent(f.name)}" title="Re-encode to a single consistent size (removes mid-stream resolution jumps)">Fix size</button> `
     : ''}
         <a href="/files/${encodeURIComponent(f.name)}" download>Download</a>
       </td>
@@ -253,11 +350,15 @@ async function refreshFiles() {
 }
 
 document.getElementById('files').addEventListener('click', async (e) => {
-  const convertBtn = e.target.closest('button[data-file-action="convert"]');
+  const convertBtn = e.target.closest(
+    'button[data-file-action="convert"], button[data-file-action="convert-scaled"]',
+  );
   if (!convertBtn) return;
   const name = decodeURIComponent(convertBtn.dataset.fileName);
+  const scale = convertBtn.dataset.fileAction === 'convert-scaled';
   convertBtn.disabled = true;
-  const resp = await api(`/api/files/${encodeURIComponent(name)}/convert`, { method: 'POST' });
+  const url = `/api/files/${encodeURIComponent(name)}/convert${scale ? '?scale=1' : ''}`;
+  const resp = await api(url, { method: 'POST' });
   if (!resp.ok) {
     convertBtn.disabled = false;
     const body = await resp.json();
@@ -302,6 +403,25 @@ document.getElementById('pause-toggle').addEventListener('click', async (e) => {
   if (pausing && !confirm('Pause monitoring? In-flight recordings are '
     + 'finalized and nothing records until you resume.')) return;
   await api(`/api/monitoring/${pausing ? 'pause' : 'resume'}`, { method: 'POST' });
+  refresh();
+});
+
+document.getElementById('scale-toggle').addEventListener('change', async (e) => {
+  const toggle = e.target;
+  const enabled = toggle.checked;
+  // Guard against the 2s poll overwriting the box before the server confirms.
+  toggle.dataset.pending = '1';
+  try {
+    const resp = await api('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify({ scale: enabled }),
+    });
+    if (!resp.ok) throw new Error('settings update failed');
+  } catch (err) {
+    toggle.checked = !enabled; // revert on failure
+  } finally {
+    delete toggle.dataset.pending;
+  }
   refresh();
 });
 

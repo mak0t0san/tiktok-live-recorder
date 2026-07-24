@@ -21,6 +21,11 @@ class FakeSupervisor:
         self.calls = []
         self.procs = {}
         self.paused = False
+        self.scale = False
+
+    def set_scale(self, enabled):
+        self.calls.append(("set_scale", enabled))
+        self.scale = bool(enabled)
 
     def snapshot(self):
         return self.procs
@@ -315,9 +320,10 @@ def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
 
     called = {}
 
-    def _fake_convert(file, bitrate=None, ffmpeg_path=None):
+    def _fake_convert(file, bitrate=None, ffmpeg_path=None, scale=False):
         called["file"] = file
         called["ffmpeg_path"] = ffmpeg_path
+        called["scale"] = scale
         converted = str(Path(file).with_name("TK_alice_2026.07.17_10-00-00.mp4"))
         Path(converted).write_bytes(b"converted")
         Path(file).unlink()
@@ -341,8 +347,44 @@ def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
     assert resp.json() == {"ok": True, "name": "TK_alice_2026.07.17_10-00-00.mp4"}
     assert called["file"] == str(raw)
     assert called["ffmpeg_path"] == "/custom/ffmpeg"
+    assert called["scale"] is False
     assert not raw.exists()
     assert (output_dir / "TK_alice_2026.07.17_10-00-00.mp4").is_file()
+
+
+def test_convert_scale_query_forwards_scale(tmp_path, monkeypatch):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    status_db = tmp_path / "status.sqlite3"
+    raw = output_dir / "TK_alice_2026.07.17_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    called = {}
+
+    def _fake_convert(file, bitrate=None, ffmpeg_path=None, scale=False):
+        called["scale"] = scale
+        converted = str(Path(file).with_name("TK_alice_2026.07.17_10-00-00.mp4"))
+        Path(converted).write_bytes(b"converted")
+        Path(file).unlink()
+        return converted
+
+    monkeypatch.setattr("web.app.VideoManagement.convert_flv_to_mp4", _fake_convert)
+
+    app = create_app(
+        supervisor=FakeSupervisor(),
+        users_file=users_file,
+        output_dir=output_dir,
+        auth=SessionAuth(PASSWORD),
+        status_db=status_db,
+    )
+    client = TestClient(app)
+    client.post("/api/login", json={"password": PASSWORD})
+
+    resp = client.post(f"/api/files/{raw.name}/convert?scale=1")
+    assert resp.status_code == 200
+    assert called["scale"] is True
 
 
 def test_convert_rejects_non_raw_file(env):
@@ -418,6 +460,46 @@ def test_pause_and_resume_monitoring(env):
     assert resp.json()["paused"] is False
     assert ("unpause",) in supervisor.calls
     assert client.get("/api/status").json()["paused"] is False
+
+
+# -- settings (size normalization toggle) --------------------------------------
+
+
+def test_status_exposes_scale_flag(env):
+    client, supervisor, _, _, _ = env
+
+    assert client.get("/api/status").json()["scale"] is False
+
+    supervisor.scale = True
+    assert client.get("/api/status").json()["scale"] is True
+
+
+def test_get_settings_reflects_supervisor(env):
+    client, supervisor, _, _, _ = env
+
+    assert client.get("/api/settings").json() == {"scale": False}
+    supervisor.scale = True
+    assert client.get("/api/settings").json() == {"scale": True}
+
+
+def test_post_settings_toggles_scale(env):
+    client, supervisor, _, _, _ = env
+
+    resp = client.post("/api/settings", json={"scale": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "scale": True}
+    assert ("set_scale", True) in supervisor.calls
+    assert supervisor.scale is True
+
+    # and back off again
+    client.post("/api/settings", json={"scale": False})
+    assert ("set_scale", False) in supervisor.calls
+    assert supervisor.scale is False
+
+
+def test_post_settings_requires_scale_field(env):
+    client, _, _, _, _ = env
+    assert client.post("/api/settings", json={}).status_code == 422
 
 
 # -- profiles / avatars ---------------------------------------------------------
