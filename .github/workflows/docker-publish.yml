@@ -50,10 +50,16 @@ jobs:
           fi
           docker run --rm --entrypoint cat tlr:smoke /app/defaults/cookies.json \
             | grep -q '"sessionid_ss": ""'
-          # No non-empty credential value anywhere in the image.
+          # No real credential value anywhere in the image. A value counts as
+          # real when it is neither empty nor a <placeholder>; the tracked
+          # cookies.sample.json legitimately ships "<paste your ... here>".
           if docker run --rm --entrypoint sh tlr:smoke -c \
-              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"]+\"" /app' | grep -q .; then
-            echo "::error::a non-empty credential value is baked into the image"
+              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' | grep -q .; then
+            # Filenames only — never echo the matching line, or a leaked
+            # credential would be republished in the workflow log.
+            echo "::error::a real credential value is baked into the image, in:"
+            docker run --rm --entrypoint sh tlr:smoke -c \
+              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' || true
             exit 1
           fi
 
@@ -99,7 +105,10 @@ jobs:
           # chowns explicitly — this is what proves the gosu step-down worked.
           db=/tmp/tlr/data/recordings/.tiktok-recorder-status.sqlite3
           test -f "$db" || { echo "::error::status DB was never created"; exit 1; }
+          # The log handler is delay=True, so the file appears only once
+          # something at DEBUG+ is written — check it opportunistically.
           for f in "$db" /tmp/tlr/data/tiktok-recorder.log; do
+            [ -e "$f" ] || continue
             owner=$(stat -c '%u:%g' "$f")
             if [ "$owner" != "568:568" ]; then
               echo "::error::$f owned by $owner, expected 568:568"
