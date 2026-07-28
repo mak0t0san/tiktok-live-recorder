@@ -1,0 +1,57 @@
+# TikTok Live Recorder — TrueNAS Custom App
+#
+# Install: Apps -> Discover -> (kebab menu) -> Install via YAML, then paste
+# this file. TrueNAS 25.10 and later require the top-level `services:` key.
+#
+# Before installing, create two datasets and give them to the apps user:
+#   zfs create <pool>/apps/tiktok-recorder
+#   zfs create <pool>/media/tiktok-recordings
+#   chown 568:568 /mnt/<pool>/apps/tiktok-recorder /mnt/<pool>/media/tiktok-recordings
+#
+# Replace <owner> and <pool> below, and change TLR_WEB_PASSWORD.
+
+services:
+  tiktok-live-recorder:
+    image: ghcr.io/<owner>/tiktok-live-recorder:latest
+    container_name: tiktok-live-recorder
+    restart: unless-stopped
+
+    environment:
+      # Dashboard login. Leave unset and the container logs a random one-off
+      # password on every start.
+      TLR_WEB_PASSWORD: change-me
+
+      # 568 is TrueNAS SCALE's built-in `apps` user, so recordings land on the
+      # dataset with sane ownership.
+      PUID: "568"
+      PGID: "568"
+      TZ: America/Los_Angeles
+
+      # Re-encode to a single resolution so TikTok's mid-stream resolution
+      # changes don't make playback shrink and grow. Costs CPU; set "false"
+      # to stream-copy instead.
+      TLR_SCALE: "true"
+
+      # Optional:
+      # TLR_INTERVAL: "5"          # minutes between liveness checks
+      # TLR_PROXY: http://host:8080
+      # TLR_TELEGRAM: "false"      # needs telegram.json filled in on /config
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # cookies.json + telegram.json. Small, worth snapshotting often.
+      - /mnt/<pool>/apps/tiktok-recorder:/config
+      # Working directory: recordings/, users.txt, the status SQLite DB and
+      # the log. Must be a local ZFS path — the status DB runs SQLite in WAL
+      # mode and will corrupt on an NFS or SMB backed mount.
+      - /mnt/<pool>/media/tiktok-recordings:/data
+
+    # Live-preview HLS segments are written to a temp dir. Keeping them in RAM
+    # avoids constant small writes to the pool.
+    tmpfs:
+      - /tmp:size=2g
+
+    # Recordings finish converting flv->mp4 on shutdown; give that room.
+    stop_grace_period: 60s

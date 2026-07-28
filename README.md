@@ -22,6 +22,7 @@ The TikTok Live Recorder is a tool designed to easily capture and save live stre
 - [Installation](#installation)
 - [Usage](#command-line-usage)
 - [Web Dashboard](#web-dashboard)
+- [Running on TrueNAS](#running-on-truenas)
 - [Guide](#guide)
 
 ## Installation
@@ -93,13 +94,25 @@ uv run python src/main.py -h
 <details>
 <summary>Docker 🐳</summary>
 
+The image runs the web dashboard and is configured with environment variables.
+Two volumes: `/config` for credentials, `/data` for everything else (recordings,
+`users.txt`, the status database, the log).
+
 ```bash
-sudo docker run \
-  -v ./output:/output \
-  michele0303/tiktok-live-recorder:latest \
-  -output /output \
-  -user <username>
+docker run -d --name tiktok-live-recorder \
+  -p 8000:8000 \
+  -e TLR_WEB_PASSWORD=changeme \
+  -e PUID=$(id -u) -e PGID=$(id -g) \
+  -v ./config:/config \
+  -v ./data:/data \
+  ghcr.io/mak0t0san/tiktok-live-recorder:latest
 ```
+
+To build it yourself: `docker build -t tiktok-live-recorder .`
+
+See [Running on TrueNAS](#running-on-truenas) for the NAS setup, and
+[Container environment variables](#container-environment-variables) for the
+full list of settings.
 
 </details>
 
@@ -176,6 +189,63 @@ reach it from other devices — anyone on the network who has the password has
 full control, and traffic is plain HTTP. Keep it on a trusted LAN or a VPN
 such as Tailscale; use `-web-host 127.0.0.1` for local-only access. If no
 password is configured, a one-off password is generated and printed at startup.
+
+## Running on TrueNAS
+
+TrueNAS SCALE 24.10 and later run apps on Docker, so the dashboard installs as
+a Custom App from a Compose file. A ready-to-edit one lives at
+[`docker/truenas-compose.yaml`](docker/truenas-compose.yaml).
+
+**1. Create the datasets.** One for credentials, one for recordings. `568` is
+TrueNAS SCALE's built-in `apps` user, which is what the container drops to by
+default:
+
+```bash
+zfs create <pool>/apps/tiktok-recorder
+zfs create <pool>/media/tiktok-recordings
+chown 568:568 /mnt/<pool>/apps/tiktok-recorder /mnt/<pool>/media/tiktok-recordings
+```
+
+`/data` must be a local ZFS path. The status database runs SQLite in WAL mode
+and will corrupt on an NFS- or SMB-backed mount.
+
+**2. Install the app.** Go to **Apps → Discover**, open the ⋮ menu, and choose
+**Install via YAML**. Paste `docker/truenas-compose.yaml` with `<owner>` and
+`<pool>` filled in and `TLR_WEB_PASSWORD` changed. TrueNAS 25.10 and later
+require the top-level `services:` key, which the file already has.
+
+**3. Add your cookies.** TikTok calls work better authenticated. Paste a valid
+session cookie into `/mnt/<pool>/apps/tiktok-recorder/cookies.json` — the
+container seeds an empty template there on first start. The dashboard's
+diagnostics panel tells you whether it picked them up.
+
+Then open `http://<truenas-ip>:8000` and log in.
+
+Upgrades are a pull-and-recreate: nothing mutable lives in the image, so your
+user list, recordings, history and cookies all survive. If you previously ran
+the container as root, `chown -R 568:568` the datasets once — the entrypoint
+only fixes ownership of the top-level directories, since recursing through a
+recordings dataset on every restart would be far too slow.
+
+### Container environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TLR_WEB_PASSWORD` | *(unset)* | Dashboard password. A random one is logged at startup if unset. |
+| `PUID` / `PGID` | `568` | User the recorder runs as; owns everything it writes. `568` is the TrueNAS `apps` user. |
+| `TZ` | `UTC` | Timezone for log and filename timestamps. |
+| `TLR_WEB_PORT` | `8000` | Port inside the container. |
+| `TLR_WEB_HOST` | `0.0.0.0` | Bind address. Leave as-is; a container must not bind to loopback. |
+| `TLR_OUTPUT` | `/data/recordings` | Where recordings, the status database and the avatar cache go. |
+| `TLR_USERS_FILE` | `/data/users.txt` | Monitored-user list. |
+| `TLR_SCALE` | `true` | Re-encode to one consistent resolution (the `-scale` flag). Set `false` to stream-copy. |
+| `TLR_INTERVAL` | `5` | Minutes between liveness checks. |
+| `TLR_PROXY` | *(unset)* | HTTP proxy for TikTok requests. |
+| `TLR_TELEGRAM` | `false` | Upload finished recordings to Telegram. Needs `telegram.json` on `/config`. |
+| `TLR_UPDATE_CHECK` | `false` | Leave off. Self-update rewrites the source tree, which an immutable image should not do — rebuild instead. |
+
+Any flag without an environment variable can still be passed through the
+Compose `command:` list; the entrypoint appends it to the generated arguments.
 
 ## Guide
 

@@ -1,0 +1,40 @@
+# Runtime credential files. These are seeded from templates by
+# docker/entrypoint.sh and bind-mounted from /config — a real session cookie
+# must never end up in an image layer.
+src/cookies.json
+src/telegram.json
+*.session
+
+# Local virtualenv and caches — the image builds its own venv.
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime state produced by a dev checkout.
+recordings/
+users.txt
+tiktok-recorder.log*
+.tiktok-recorder.lock
+.tiktok-recorder-status.sqlite3*
+
+# Repo metadata not needed to build or run.
+.git/
+.github/
+.idea/
+.junie/
+.claude/
+.remember/
+tests/
+docs/
+.DS_Store
+*.md
+!README.md
+.pre-commit-config.yaml
+.codacy.yml
+.gitignore
+run.sh

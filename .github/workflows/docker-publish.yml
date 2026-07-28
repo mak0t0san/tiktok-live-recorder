@@ -6,41 +6,156 @@ on:
       - '**'
     paths:
       - 'src/**'
+      - 'docker/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/docker-publish.yml'
   release:
     types: [published]
 
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
 jobs:
-  build:
+  # Boots the image and exercises the dashboard. The image spent a long time
+  # in a state where it built fine but could not start, so the push is gated
+  # on this.
+  smoke:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - name: Build image for testing
+        uses: docker/build-push-action@v5
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          context: .
+          load: true
+          tags: tlr:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Set Docker tags
-        id: vars
+      - name: Assert no real credentials were baked into the image
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "TAGS=${{ vars.DOCKERHUB_REPOSITORY }}:latest,${{ vars.DOCKERHUB_REPOSITORY }}:${{ github.event.release.tag_name }}" >> $GITHUB_ENV
-          else
-            BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's#refs/heads/##' | sed 's#/#-#g')
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-            echo "TAGS=${{ vars.DOCKERHUB_REPOSITORY }}:${BRANCH_NAME}-${SHORT_SHA},${{ vars.DOCKERHUB_REPOSITORY }}:${BRANCH_NAME}" >> $GITHUB_ENV
+          # --entrypoint is required: without it these become arguments to the
+          # recorder rather than a command, and the check silently passes.
+          # cookies.json is excluded by .dockerignore, so only the empty
+          # template under /app/defaults should exist.
+          if docker run --rm --entrypoint test tlr:smoke -e /app/cookies.json; then
+            echo "::error::/app/cookies.json is in the image; .dockerignore is not excluding it"
+            exit 1
+          fi
+          docker run --rm --entrypoint cat tlr:smoke /app/defaults/cookies.json \
+            | grep -q '"sessionid_ss": ""'
+          # No non-empty credential value anywhere in the image.
+          if docker run --rm --entrypoint sh tlr:smoke -c \
+              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"]+\"" /app' | grep -q .; then
+            echo "::error::a non-empty credential value is baked into the image"
+            exit 1
           fi
 
-      - name: Build and push Docker image
+      - name: Start container
+        run: |
+          mkdir -p /tmp/tlr/data /tmp/tlr/config
+          chmod 777 /tmp/tlr/data /tmp/tlr/config
+          docker run -d --name tlr -p 8000:8000 \
+            -e TLR_WEB_PASSWORD=smoketest \
+            -e PUID=568 -e PGID=568 \
+            -v /tmp/tlr/data:/data \
+            -v /tmp/tlr/config:/config \
+            tlr:smoke
+
+      - name: Wait for the dashboard to answer
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/login > /dev/null; then
+              echo "dashboard up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::dashboard did not come up"
+          docker logs tlr
+          exit 1
+
+      - name: Authenticate and read the status API
+        run: |
+          curl -sf -c /tmp/tlr/cookies -X POST http://localhost:8000/api/login \
+            -H 'content-type: application/json' \
+            -d '{"password":"smoketest"}' | grep -q '"ok":true'
+          curl -sf -b /tmp/tlr/cookies http://localhost:8000/api/status | grep -q '\['
+          # ffmpeg must be resolvable inside the container or nothing records.
+          curl -sf -b /tmp/tlr/cookies http://localhost:8000/api/diagnostics
+
+      - name: Assert state landed on the volume with the right owner
+        run: |
+          test -f /tmp/tlr/data/users.txt
+          test -d /tmp/tlr/data/recordings
+          test -f /tmp/tlr/config/cookies.json
+          # Check a file the *application* creates, not one the entrypoint
+          # chowns explicitly — this is what proves the gosu step-down worked.
+          db=/tmp/tlr/data/recordings/.tiktok-recorder-status.sqlite3
+          test -f "$db" || { echo "::error::status DB was never created"; exit 1; }
+          for f in "$db" /tmp/tlr/data/tiktok-recorder.log; do
+            owner=$(stat -c '%u:%g' "$f")
+            if [ "$owner" != "568:568" ]; then
+              echo "::error::$f owned by $owner, expected 568:568"
+              exit 1
+            fi
+          done
+
+      - name: Assert clean shutdown
+        run: |
+          start=$(date +%s)
+          docker stop -t 30 tlr
+          echo "stopped in $(( $(date +%s) - start ))s"
+          docker logs tlr
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs tlr || true
+
+  build:
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-,format=short
+            type=semver,pattern={{version}},event=tag
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.TAGS }}
+          # TrueNAS SCALE is x86-64 only.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
