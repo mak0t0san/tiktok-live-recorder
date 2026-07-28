@@ -144,6 +144,7 @@ dmypy.json
 # recording lock files (per-user + global single-instance guard)
 .tiktok-recorder.lock
 .tiktok-rec.*.lock
+tiktok-recorder.log*
 
 # web dashboard runtime state (status DB + cached avatar thumbnails)
 .tiktok-recorder-status.sqlite3*
