@@ -52,16 +52,36 @@ class Preview:
                 "2",
                 "-hls_list_size",
                 "6",
+                # Keep ~10 already-rotated segments on disk beyond the 6 in the
+                # playlist. While ffmpeg churns through the on-disk backlog at
+                # disk speed it produces (and would otherwise immediately delete)
+                # segments far faster than the browser can fetch them; the extra
+                # retained segments keep the ones a served playlist references
+                # from being unlinked before the browser requests them.
+                "-hls_delete_threshold",
+                "10",
                 "-hls_flags",
                 "delete_segments+independent_segments",
                 str(self.playlist),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
         self._follower = threading.Thread(target=self._follow, daemon=True)
         self._follower.start()
+
+    def _drain_stderr(self):
+        """Forward ffmpeg's stderr to the log so copy/codec failures are visible."""
+        try:
+            for raw in iter(self._proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    logger.warning(f"[preview @{self.user}] ffmpeg: {line}")
+        except (OSError, ValueError):
+            pass
 
     def _follow(self):
         """
@@ -85,6 +105,12 @@ class Preview:
                 self._proc.stdin.close()
             except OSError:
                 pass
+            # If ffmpeg died on its own (not our stop request), it produced no
+            # usable playlist — surface the exit code so the resulting 404 is
+            # explained in the log rather than being a silent dead end.
+            code = self._proc.poll()
+            if code not in (None, 0) and not self._stop.is_set():
+                logger.warning(f"[preview @{self.user}] ffmpeg exited with code {code}")
 
     def touch(self):
         self.last_access = time.monotonic()
@@ -101,6 +127,7 @@ class Preview:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._follower.join(timeout=5)
+        self._stderr_thread.join(timeout=5)
         shutil.rmtree(self.out_dir, ignore_errors=True)
 
 
