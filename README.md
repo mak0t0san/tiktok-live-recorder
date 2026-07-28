@@ -105,8 +105,11 @@ docker run -d --name tiktok-live-recorder \
   -e PUID=$(id -u) -e PGID=$(id -g) \
   -v ./config:/config \
   -v ./data:/data \
-  ghcr.io/mak0t0san/tiktok-live-recorder:latest
+  ghcr.io/mak0t0san/tiktok-live-recorder:main
 ```
+
+Branch builds are tagged with the branch name; `latest` is published only on a
+tagged release.
 
 To build it yourself: `docker build -t tiktok-live-recorder .`
 
@@ -196,28 +199,55 @@ TrueNAS SCALE 24.10 and later run apps on Docker, so the dashboard installs as
 a Custom App from a Compose file. A ready-to-edit one lives at
 [`docker/truenas-compose.yaml`](docker/truenas-compose.yaml).
 
-**1. Create the datasets.** One for credentials, one for recordings. `568` is
-TrueNAS SCALE's built-in `apps` user, which is what the container drops to by
-default:
+**0. Make the image pullable.** Packages published to GHCR are private by
+default. Either make the package public (GitHub → Packages → the package →
+Package settings → Change visibility), or the pull will fail with
+`unauthorized`. Note that branch builds are tagged with the branch name;
+`latest` appears only once a release is published.
+
+**1. Create a dataset for the recordings.** Put it wherever you keep your own
+data — **not** under `<pool>/ix-apps`, which TrueNAS manages itself. `568` is
+TrueNAS SCALE's built-in `apps` user, which is what the container drops to:
 
 ```bash
-zfs create <pool>/apps/tiktok-recorder
-zfs create <pool>/media/tiktok-recordings
-chown 568:568 /mnt/<pool>/apps/tiktok-recorder /mnt/<pool>/media/tiktok-recordings
+zfs create <pool>/<parent>/tiktok-recordings
+chown 568:568 /mnt/<pool>/<parent>/tiktok-recordings
 ```
 
-`/data` must be a local ZFS path. The status database runs SQLite in WAL mode
-and will corrupt on an NFS- or SMB-backed mount.
+This becomes `/data`: recordings, `users.txt`, the status database and the log.
+It grows with every recording, so keep it somewhere you can share over SMB and
+snapshot on its own schedule. It must be a local ZFS path — the status database
+runs SQLite in WAL mode and will corrupt on an NFS- or SMB-backed mount.
 
-**2. Install the app.** Go to **Apps → Discover**, open the ⋮ menu, and choose
-**Install via YAML**. Paste `docker/truenas-compose.yaml` with `<owner>` and
-`<pool>` filled in and `TLR_WEB_PASSWORD` changed. TrueNAS 25.10 and later
-require the top-level `services:` key, which the file already has.
+`/config` holds just `cookies.json` and `telegram.json`. How you provide it
+depends on which install route you take, below.
 
-**3. Add your cookies.** TikTok calls work better authenticated. Paste a valid
-session cookie into `/mnt/<pool>/apps/tiktok-recorder/cookies.json` — the
-container seeds an empty template there on first start. The dashboard's
-diagnostics panel tells you whether it picked them up.
+**2a. Install via YAML** *(one paste, recommended)*. **Apps → Discover**, ⋮ menu,
+**Install via YAML**, and paste [`docker/truenas-compose.yaml`](docker/truenas-compose.yaml)
+with `<owner>`, `<pool>` and `<parent>` filled in and `TLR_WEB_PASSWORD`
+changed. TrueNAS 25.10 and later require the top-level `services:` key, which
+the file already has. This route needs `/config` as a second dataset — create
+it the same way as above.
+
+**2b. Or install through the Custom App form.** Set Repository to
+`ghcr.io/<owner>/tiktok-live-recorder`, Tag to the branch name, Pull Policy to
+*always*, and leave Entrypoint and Command empty. Add `TLR_WEB_PASSWORD`,
+`PUID=568` and `PGID=568` as environment variables, forward port 8000, and
+under Storage add two mounts:
+
+| Mount path | Type | Notes |
+|------------|------|-------|
+| `/config` | **ixVolume** named `config` | TrueNAS creates and owns it under `<pool>/ix-apps/app_mounts/<appname>/`. Deleting the app can delete it, taking `cookies.json` with it — use a host path instead if that matters. |
+| `/data` | **Host Path** | The dataset from step 1. |
+
+The container must start as **root** so it can seed `/config` and fix
+ownership; it drops to `PUID:PGID` itself before recording anything. If the
+Security Context section exposes a run-as user, set it to `0`.
+
+**3. Add your cookies.** TikTok calls work better authenticated. The container
+seeds an empty template on first start; paste a valid session cookie into the
+`cookies.json` on your `/config` mount. The dashboard's diagnostics panel
+reports the exact path and whether it picked the cookie up.
 
 Then open `http://<truenas-ip>:8000` and log in.
 

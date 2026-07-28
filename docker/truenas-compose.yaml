@@ -3,16 +3,26 @@
 # Install: Apps -> Discover -> (kebab menu) -> Install via YAML, then paste
 # this file. TrueNAS 25.10 and later require the top-level `services:` key.
 #
-# Before installing, create two datasets and give them to the apps user:
-#   zfs create <pool>/apps/tiktok-recorder
-#   zfs create <pool>/media/tiktok-recordings
-#   chown 568:568 /mnt/<pool>/apps/tiktok-recorder /mnt/<pool>/media/tiktok-recordings
+# Before installing, create two datasets on a data pool and give them to the
+# apps user (568). Put them anywhere you would keep your own data — NOT under
+# <pool>/ix-apps, which TrueNAS manages itself:
 #
-# Replace <owner> and <pool> below, and change TLR_WEB_PASSWORD.
+#   zfs create <pool>/<parent>/tiktok-recorder-config
+#   zfs create <pool>/<parent>/tiktok-recordings
+#   chown 568:568 /mnt/<pool>/<parent>/tiktok-recorder-config \
+#                 /mnt/<pool>/<parent>/tiktok-recordings
+#
+# Replace <owner>, <pool> and <parent> below, and change TLR_WEB_PASSWORD.
+#
+# Installing through the Custom App *form* instead? See the TrueNAS section of
+# the README — there /config is better served by an ixVolume, which the form
+# creates for you and this file cannot express.
 
 services:
   tiktok-live-recorder:
-    image: ghcr.io/<owner>/tiktok-live-recorder:latest
+    # `latest` exists only once a GitHub release is published; branch builds
+    # are tagged with the branch name.
+    image: ghcr.io/<owner>/tiktok-live-recorder:main
     container_name: tiktok-live-recorder
     restart: unless-stopped
 
@@ -42,11 +52,13 @@ services:
 
     volumes:
       # cookies.json + telegram.json. Small, worth snapshotting often.
-      - /mnt/<pool>/apps/tiktok-recorder:/config
+      - /mnt/<pool>/<parent>/tiktok-recorder-config:/config
       # Working directory: recordings/, users.txt, the status SQLite DB and
-      # the log. Must be a local ZFS path — the status DB runs SQLite in WAL
-      # mode and will corrupt on an NFS or SMB backed mount.
-      - /mnt/<pool>/media/tiktok-recordings:/data
+      # the log. Keep this on a normal dataset you can share and snapshot on
+      # its own schedule — it grows with every recording. It must also be a
+      # local ZFS path: the status DB runs SQLite in WAL mode and will corrupt
+      # on an NFS or SMB backed mount.
+      - /mnt/<pool>/<parent>/tiktok-recordings:/data
 
     # Live-preview HLS segments are written to a temp dir. Keeping them in RAM
     # avoids constant small writes to the pool.
