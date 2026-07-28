@@ -6,6 +6,7 @@ recording state comes from the SQLite status store, and the list of monitored
 users lives in the users file (shared with the CLI).
 """
 
+import json
 import time
 from pathlib import Path
 
@@ -395,8 +396,8 @@ def create_app(
 
         Fields
         ------
-        cookies_file      : str          — path to src/cookies.json
-        cookies_present   : bool         — file exists and is non-empty
+        cookies_file      : str          — path to cookies.json
+        cookies_present   : bool         — file holds a non-empty sessionid_ss
         cookies_hint      : str          — actionable advice
 
         tikrec_url        : str          — tikrec signing service base URL
@@ -407,7 +408,19 @@ def create_app(
 
         # --- cookies ---
         cookies_path = Path(__file__).parent.parent / "cookies.json"
-        cookies_present = cookies_path.is_file() and cookies_path.stat().st_size > 10
+        if cookies_path.is_symlink():
+            # In the container this points at the /config volume, which is the
+            # path the user can actually edit.
+            cookies_path = cookies_path.resolve()
+        # Check for an actual session value rather than file size: a seeded
+        # template with empty values is well over any size threshold but is
+        # not usable, which would report a false "cookies found".
+        try:
+            cookies_present = bool(
+                json.loads(cookies_path.read_text(encoding="utf-8")).get("sessionid_ss")
+            )
+        except (OSError, ValueError):
+            cookies_present = False
         result["cookies_file"] = str(cookies_path)
         result["cookies_present"] = cookies_present
         result["cookies_hint"] = (
@@ -415,8 +428,9 @@ def create_app(
             "session cookies."
             if cookies_present
             else (
-                "cookies.json is missing or empty. Copy a valid TikTok session "
-                "cookie JSON to src/cookies.json to enable authenticated requests."
+                f"No TikTok session cookie configured. Add a valid "
+                f"'sessionid_ss' to {cookies_path} to enable authenticated "
+                f"requests."
             )
         )
 
