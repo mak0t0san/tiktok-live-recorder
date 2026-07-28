@@ -306,6 +306,61 @@ def test_stale_404_url_does_not_retry_forever(tmp_path, monkeypatch):
     assert api.download_calls == 2
 
 
+class StartupStallAPI:
+    """First CDN candidate accepts the connection but never sends data
+    (transient read timeouts); the second candidate streams fine."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.attempts = []
+
+    def is_room_alive(self, room_id):
+        return True
+
+    def get_live_url_candidates(self, room_id, user=None):
+        return ["https://cdn/stall.flv", "https://cdn/good.flv"]
+
+    def download_live_stream(self, live_url):
+        from requests import ReadTimeout
+
+        self.attempts.append(live_url)
+        if "stall" in live_url:
+            # Safety net: a regression that retries the dead URL forever
+            # would otherwise hang the whole suite. Bail out after many tries.
+            if self.attempts.count(live_url) > 10:
+                self.recorder._stop_event.set()
+                return
+            raise ReadTimeout("read timed out")
+            yield  # pragma: no cover
+        yield b"x" * 8192
+        # Healthy candidate delivered data; stop cleanly so the recording
+        # finalizes instead of re-downloading forever.
+        self.recorder._stop_event.set()
+
+
+def test_startup_stall_advances_to_next_candidate(tmp_path, monkeypatch):
+    recorder = _build_recorder(tmp_path, mode=Mode.MANUAL)
+    api = StartupStallAPI(recorder)
+    recorder.tiktok = api
+
+    monkeypatch.setattr("core.tiktok_recorder.time.sleep", lambda s: None)
+    converted = []
+    monkeypatch.setattr(
+        VideoManagement,
+        "convert_flv_to_mp4",
+        lambda *args, **kwargs: converted.append(args),
+    )
+
+    recorder.start_recording("creator", "1234567890")
+
+    # A candidate that never delivers data is abandoned after a bounded
+    # number of no-progress retries instead of being hammered forever.
+    assert api.attempts.count("https://cdn/stall.flv") <= 3
+    # ...and we self-heal by advancing to the healthy candidate.
+    assert "https://cdn/good.flv" in api.attempts
+    assert converted, "should record the working candidate after the stall"
+
+
 class FiniteStreamAPI:
     """Yields one large chunk, then the stream ends normally."""
 

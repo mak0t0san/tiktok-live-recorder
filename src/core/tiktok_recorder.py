@@ -19,6 +19,15 @@ from utils.enums import Mode, Error, TimeOut, TikTokError
 from utils.recording_lock import recording_lock
 from utils.status_store import NullStatusReporter, StatusReporter
 
+# A CDN edge sometimes accepts the connection but never delivers media bytes
+# (common the instant a stream goes live, or on a stale edge). Without a
+# watchdog the record loop retries that same dead URL forever, leaving a
+# 0-byte file. After this many consecutive no-data retries on a candidate we
+# abandon it and move on to the next CDN candidate (which re-resolves fresh
+# URLs once all candidates are exhausted). ~2 retries ≈ 60s given the 30s
+# stream read timeout.
+STARTUP_STALL_MAX_RETRIES = 2
+
 
 class TikTokRecorder:
     def __init__(self, config: RecorderConfig):
@@ -32,6 +41,7 @@ class TikTokRecorder:
         self.duration = config.duration
         self.output = config.output
         self.bitrate = config.bitrate
+        self.scale = config.scale
         self.ffmpeg_path = config.ffmpeg_path
         self.use_telegram = config.use_telegram
         self._proxy = config.proxy
@@ -230,7 +240,12 @@ class TikTokRecorder:
             with open(output, "wb") as out_file:
                 stop_recording = False
                 stream_ended = False
+                # Counts consecutive retries on this candidate that made no
+                # progress while still below min_stream_bytes; drives the
+                # startup stall watchdog below.
+                stall_retries = 0
                 while not stop_recording:
+                    transient_error = False
                     try:
                         if self._stop_event.is_set():
                             stop_recording = True
@@ -266,6 +281,7 @@ class TikTokRecorder:
                             break
 
                     except ConnectionError:
+                        transient_error = True
                         if self.mode == Mode.AUTOMATIC:
                             logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                             time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
@@ -287,10 +303,12 @@ class TikTokRecorder:
                                 "trying another CDN/quality..."
                             )
                             break
+                        transient_error = True
                         logger.warning(f"Network hiccup, retrying: {ex}")
                         time.sleep(2)
 
                     except (RequestException, HTTPException) as ex:
+                        transient_error = True
                         logger.warning(f"Network hiccup, retrying: {ex}")
                         time.sleep(2)
 
@@ -311,6 +329,23 @@ class TikTokRecorder:
                             out_file.write(buffer)
                             buffer.clear()
                         out_file.flush()
+
+                    # Startup stall watchdog: while we've still received no
+                    # usable data, a transient error means this candidate is
+                    # not delivering. Give up after a few consecutive no-data
+                    # retries and let the outer loop try the next candidate
+                    # instead of hammering a dead URL forever (0-byte file).
+                    if transient_error and bytes_written < min_stream_bytes:
+                        stall_retries += 1
+                        if stall_retries > STARTUP_STALL_MAX_RETRIES:
+                            logger.warning(
+                                f"Stream {index}/{len(live_urls)} sent no data "
+                                f"after {stall_retries} attempts; "
+                                "trying another CDN/quality..."
+                            )
+                            break
+                    elif bytes_written >= min_stream_bytes:
+                        stall_retries = 0
 
             if bytes_written >= min_stream_bytes:
                 break
@@ -346,7 +381,7 @@ class TikTokRecorder:
         )
         self._status.report(state="converting", bytes_written=bytes_written)
         converted = VideoManagement.convert_flv_to_mp4(
-            output, self.bitrate, self.ffmpeg_path
+            output, self.bitrate, self.ffmpeg_path, scale=self.scale
         )
         if converted:
             self._status.report(state="converting", output_path=str(converted))

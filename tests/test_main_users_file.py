@@ -49,6 +49,7 @@ def _args(users_file):
         duration=None,
         telegram=False,
         bitrate=None,
+        scale=False,
         ffmpeg_path=None,
     )
 

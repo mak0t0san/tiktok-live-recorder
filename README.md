@@ -123,6 +123,7 @@ uv run python src/main.py [options]
 | `-duration <SECONDS>` | Stop recording after this many seconds. |
 | `-proxy <URL>` | HTTP proxy to bypass regional restrictions. |
 | `-bitrate <BITRATE>` | Output bitrate for post-processing (e.g. `1M`, `1000k`). |
+| `-scale` | Re-encode the recording to a single consistent size (the highest resolution seen anywhere in the recording) so TikTok's mid-stream resolution changes don't make the video shrink and grow on playback. Slower and slightly lossy. |
 | `-telegram` | Upload the recording to Telegram when done. Requires `telegram.json`. |
 | `-web` | Start the web dashboard instead of the plain CLI (see [Web Dashboard](#web-dashboard)). |
 | `-web-host <HOST>` | Interface for the web dashboard. Default: `0.0.0.0` (all interfaces). |

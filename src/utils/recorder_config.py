@@ -16,6 +16,10 @@ class RecorderConfig:
     duration: int | None = None
     use_telegram: bool = False
     bitrate: str | None = None
+    # When True, re-encode the finished recording onto a single canvas (the
+    # highest resolution seen in the recording) so mid-stream resolution
+    # changes don't make playback shrink/grow.
+    scale: bool = False
     ffmpeg_path: str | None = None
     # Optional multiprocessing.Event set by the parent (supervisor/web UI) to
     # request a cooperative stop; the recorder finalizes the in-flight

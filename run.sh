@@ -18,4 +18,4 @@ uv sync --extra web
 mkdir -p ./recordings
 
 exec uv run --extra web \
-  python src/main.py -web -output ./recordings -no-update-check "$@"
+  python src/main.py -web -scale -output ./recordings -no-update-check "$@"

@@ -114,6 +114,19 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-scale",
+        dest="scale",
+        action="store_true",
+        help=(
+            "Re-encode the recording onto a single consistent size (the "
+            "highest resolution seen anywhere in the recording) so TikTok's "
+            "mid-stream resolution changes no longer make the video shrink and "
+            "grow on playback.\n"
+            "Slower and slightly lossy since it re-encodes instead of copying."
+        ),
+    )
+
+    parser.add_argument(
         "-ffmpeg-path",
         dest="ffmpeg_path",
         help="Specify a custom path to the ffmpeg binary. [Default: 'ffmpeg']",
