@@ -273,7 +273,7 @@ def create_app(
 
     # -- completed recordings -----------------------------------------------
 
-    def _active_raw_outputs() -> set[str]:
+    def _active_raw_outputs() -> set[Path]:
         store = StatusStore(status_db)
         try:
             rows = store.all()
@@ -285,41 +285,73 @@ def create_app(
             output_path = row.get("output_path")
             if not output_path:
                 continue
-            output_name = Path(output_path).name
-            if not output_name.endswith("_flv.mp4"):
+            path = Path(output_path)
+            if not path.name.endswith("_flv.mp4"):
                 continue
             if row.get("state") in {"stopped", "error", "stale"}:
                 continue
-            active.add(output_name)
+            # compared as whole paths, not basenames: two creators can produce
+            # identically-named files in their own folders
+            active.add(_resolve_quietly(path))
         return active
+
+    def _resolve_quietly(path: Path) -> Path:
+        try:
+            return path.resolve()
+        except OSError:
+            return path
+
+    def _relative_name(path: Path, root: Path) -> str:
+        """Output-relative POSIX path, the identifier the API speaks in."""
+        return path.relative_to(root).as_posix()
+
+    def _resolve_in_output_dir(name: str) -> Path | None:
+        """
+        Map an API file name onto a real path inside the output directory.
+
+        Returns ``None`` when the name escapes the output tree (``../``, an
+        absolute path) or is not an ``.mp4``, so callers can 404 uniformly.
+        """
+        root = output_dir.resolve()
+        target = _resolve_quietly(output_dir / name)
+        if target == root or not target.is_relative_to(root):
+            return None
+        if target.suffix != ".mp4":
+            return None
+        return target
 
     @app.get("/api/files")
     def list_files():
         active_raw_outputs = _active_raw_outputs()
+        root = output_dir.resolve()
         files = []
-        for path in output_dir.glob("*.mp4"):
+        # rglob, not glob: recordings live in per-user folders, and files made
+        # before that change still sit at the output root
+        for path in root.rglob("*.mp4"):
+            if not path.is_file():
+                continue
             stat = path.stat()
             raw = path.name.endswith("_flv.mp4")
+            parent = path.parent
             files.append(
                 {
-                    "name": path.name,
+                    "name": _relative_name(path, root),
+                    "user": None if parent == root else parent.name,
                     "size": stat.st_size,
                     "mtime": stat.st_mtime,
                     # still-raw FLV data (recording in progress or conversion
                     # failed); converted files drop the _flv suffix
                     "raw": raw,
-                    "convertible": raw and path.name not in active_raw_outputs,
+                    "convertible": raw and path not in active_raw_outputs,
                 }
             )
         files.sort(key=lambda f: f["mtime"], reverse=True)
         return {"files": files}
 
-    @app.post("/api/files/{name}/convert")
+    @app.post("/api/files/convert")
     def convert_file(name: str, scale: bool = False):
-        target = (output_dir / name).resolve()
-        if target.parent != output_dir.resolve() or target.suffix != ".mp4":
-            return JSONResponse({"detail": "Not found"}, status_code=404)
-        if not target.is_file():
+        target = _resolve_in_output_dir(name)
+        if target is None or not target.is_file():
             return JSONResponse({"detail": "Not found"}, status_code=404)
         if not target.name.endswith("_flv.mp4"):
             return JSONResponse(
@@ -327,7 +359,7 @@ def create_app(
                 status_code=409,
             )
 
-        if target.name in _active_raw_outputs():
+        if target in _active_raw_outputs():
             return JSONResponse(
                 {"detail": "File is still being recorded or converted"},
                 status_code=409,
@@ -338,17 +370,21 @@ def create_app(
         )
         if not converted:
             return JSONResponse({"detail": "Conversion failed"}, status_code=500)
-        return {"ok": True, "name": Path(converted).name}
+        return {
+            "ok": True,
+            "name": _relative_name(
+                _resolve_quietly(Path(converted)), output_dir.resolve()
+            ),
+        }
 
-    @app.get("/files/{name}")
+    @app.get("/files")
     def download_file(name: str):
-        # forbid path traversal: the name must resolve inside output_dir
-        target = (output_dir / name).resolve()
-        if target.parent != output_dir.resolve() or target.suffix != ".mp4":
+        # the name is a query parameter, not a path segment, so a nested
+        # "alice/TK_....mp4" survives proxies that normalise %2F in paths
+        target = _resolve_in_output_dir(name)
+        if target is None or not target.is_file():
             return JSONResponse({"detail": "Not found"}, status_code=404)
-        if not target.is_file():
-            return JSONResponse({"detail": "Not found"}, status_code=404)
-        return FileResponse(target, filename=name)
+        return FileResponse(target, filename=target.name)
 
     # -- live preview (wired in web/preview.py) -----------------------------
 

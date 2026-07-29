@@ -303,10 +303,95 @@ def test_files_listing_and_download(env):
     assert by_name["TK_bob_2026.07.17_10-00-00_flv.mp4"]["convertible"] is True
     assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["raw"] is True
     assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["convertible"] is False
+    # recordings made before per-user folders existed sit at the output root
+    assert by_name["TK_alice_2026.07.17_10-00-00.mp4"]["user"] is None
 
-    resp = client.get("/files/TK_alice_2026.07.17_10-00-00.mp4")
+    resp = client.get("/files", params={"name": "TK_alice_2026.07.17_10-00-00.mp4"})
     assert resp.status_code == 200
     assert resp.content == b"video"
+
+
+def test_files_listing_walks_per_user_folders(env):
+    client, _, _, output_dir, status_db = env
+    (output_dir / "TK_legacy_2026.07.17_10-00-00.mp4").write_bytes(b"flat")
+    alice_dir = output_dir / "alice"
+    alice_dir.mkdir()
+    (alice_dir / "TK_alice_2026.07.18_10-00-00.mp4").write_bytes(b"nested")
+    (alice_dir / "TK_alice_2026.07.18_11-00-00_flv.mp4").write_bytes(b"nested-raw")
+
+    files = client.get("/api/files").json()["files"]
+    by_name = {f["name"]: f for f in files}
+
+    # names are output-relative POSIX paths so the same string round-trips
+    # through the download and convert endpoints
+    assert by_name["alice/TK_alice_2026.07.18_10-00-00.mp4"]["user"] == "alice"
+    assert by_name["alice/TK_alice_2026.07.18_11-00-00_flv.mp4"]["convertible"] is True
+    # legacy flat files stay visible
+    assert by_name["TK_legacy_2026.07.17_10-00-00.mp4"]["user"] is None
+
+
+def test_download_nested_file_by_relative_path(env):
+    client, _, _, output_dir, _ = env
+    alice_dir = output_dir / "alice"
+    alice_dir.mkdir()
+    (alice_dir / "TK_alice_2026.07.18_10-00-00.mp4").write_bytes(b"nested")
+
+    resp = client.get(
+        "/files", params={"name": "alice/TK_alice_2026.07.18_10-00-00.mp4"}
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"nested"
+
+
+def test_convert_nested_raw_file(env):
+    client, _, _, output_dir, _ = env
+    alice_dir = output_dir / "alice"
+    alice_dir.mkdir()
+    raw = alice_dir / "TK_alice_2026.07.18_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    resp = client.post(
+        "/api/files/convert",
+        params={"name": "alice/TK_alice_2026.07.18_10-00-00_flv.mp4"},
+    )
+    # ffmpeg is not stubbed here, so the conversion itself fails -- what matters
+    # is that the nested path was accepted rather than 404'd by the guard
+    assert resp.status_code != 404
+
+
+def test_convert_returns_an_output_relative_name(tmp_path, monkeypatch):
+    users_file = tmp_path / "users.txt"
+    users_file.write_text("")
+    output_dir = tmp_path / "out"
+    (output_dir / "alice").mkdir(parents=True)
+    raw = output_dir / "alice" / "TK_alice_2026.07.18_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    def _fake_convert(file, bitrate=None, ffmpeg_path=None, scale=False):
+        converted = str(Path(file).with_name("TK_alice_2026.07.18_10-00-00.mp4"))
+        Path(converted).write_bytes(b"converted")
+        Path(file).unlink()
+        return converted
+
+    monkeypatch.setattr("web.app.VideoManagement.convert_flv_to_mp4", _fake_convert)
+
+    app = create_app(
+        supervisor=FakeSupervisor(),
+        users_file=users_file,
+        output_dir=output_dir,
+        auth=SessionAuth(PASSWORD),
+        status_db=tmp_path / "status.sqlite3",
+    )
+    client = TestClient(app)
+    client.post("/api/login", json={"password": PASSWORD})
+
+    resp = client.post(
+        "/api/files/convert",
+        params={"name": "alice/TK_alice_2026.07.18_10-00-00_flv.mp4"},
+    )
+    assert resp.status_code == 200
+    # the frontend feeds this straight back into the download link
+    assert resp.json() == {"ok": True, "name": "alice/TK_alice_2026.07.18_10-00-00.mp4"}
 
 
 def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
@@ -342,7 +427,7 @@ def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
     client = TestClient(app)
     client.post("/api/login", json={"password": PASSWORD})
 
-    resp = client.post(f"/api/files/{raw.name}/convert")
+    resp = client.post("/api/files/convert", params={"name": raw.name})
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "name": "TK_alice_2026.07.17_10-00-00.mp4"}
     assert called["file"] == str(raw)
@@ -382,7 +467,7 @@ def test_convert_scale_query_forwards_scale(tmp_path, monkeypatch):
     client = TestClient(app)
     client.post("/api/login", json={"password": PASSWORD})
 
-    resp = client.post(f"/api/files/{raw.name}/convert?scale=1")
+    resp = client.post("/api/files/convert", params={"name": raw.name, "scale": 1})
     assert resp.status_code == 200
     assert called["scale"] is True
 
@@ -392,7 +477,7 @@ def test_convert_rejects_non_raw_file(env):
     file = output_dir / "TK_alice_2026.07.17_10-00-00.mp4"
     file.write_bytes(b"video")
 
-    resp = client.post(f"/api/files/{file.name}/convert")
+    resp = client.post("/api/files/convert", params={"name": file.name})
     assert resp.status_code == 409
     assert "Only raw" in resp.json()["detail"]
 
@@ -412,9 +497,62 @@ def test_convert_rejects_active_raw_file(env):
     )
     store.close()
 
-    resp = client.post(f"/api/files/{raw.name}/convert")
+    resp = client.post("/api/files/convert", params={"name": raw.name})
     assert resp.status_code == 409
     assert "still being recorded or converted" in resp.json()["detail"]
+
+
+def test_convert_rejects_active_raw_file_in_a_per_user_folder(env):
+    client, _, _, output_dir, status_db = env
+    alice_dir = output_dir / "alice"
+    alice_dir.mkdir()
+    raw = alice_dir / "TK_alice_2026.07.18_10-00-00_flv.mp4"
+    raw.write_bytes(b"raw")
+
+    store = StatusStore(status_db)
+    store.update(
+        "alice",
+        state="recording",
+        pid=os.getpid(),
+        output_path=str(raw),
+        bytes_written=10,
+    )
+    store.close()
+
+    listed = client.get("/api/files").json()["files"]
+    nested = next(f for f in listed if f["name"].startswith("alice/"))
+    assert nested["convertible"] is False
+
+    resp = client.post("/api/files/convert", params={"name": nested["name"]})
+    assert resp.status_code == 409
+    assert "still being recorded or converted" in resp.json()["detail"]
+
+
+def test_convert_matches_active_recordings_by_path_not_basename(env):
+    client, _, _, output_dir, status_db = env
+    alice_dir = output_dir / "alice"
+    alice_dir.mkdir()
+    bob_dir = output_dir / "bob"
+    bob_dir.mkdir()
+    # same basename in two folders: only alice's copy is being recorded
+    active = alice_dir / "TK_x_2026.07.18_10-00-00_flv.mp4"
+    active.write_bytes(b"raw")
+    idle = bob_dir / "TK_x_2026.07.18_10-00-00_flv.mp4"
+    idle.write_bytes(b"raw")
+
+    store = StatusStore(status_db)
+    store.update(
+        "alice",
+        state="recording",
+        pid=os.getpid(),
+        output_path=str(active),
+        bytes_written=10,
+    )
+    store.close()
+
+    files = {f["name"]: f for f in client.get("/api/files").json()["files"]}
+    assert files["alice/TK_x_2026.07.18_10-00-00_flv.mp4"]["convertible"] is False
+    assert files["bob/TK_x_2026.07.18_10-00-00_flv.mp4"]["convertible"] is True
 
 
 def test_download_blocks_path_traversal(env):
@@ -422,8 +560,22 @@ def test_download_blocks_path_traversal(env):
     secret = output_dir.parent / "secret.mp4"
     secret.write_bytes(b"nope")
 
-    assert client.get("/files/..%2Fsecret.mp4").status_code == 404
-    assert client.get("/files/%2e%2e%2fsecret.mp4").status_code == 404
+    assert client.get("/files", params={"name": "../secret.mp4"}).status_code == 404
+    assert client.get("/files", params={"name": "..%2Fsecret.mp4"}).status_code == 404
+    assert (
+        client.get("/files", params={"name": "a/../../secret.mp4"}).status_code == 404
+    )
+    assert client.get("/files", params={"name": "/etc/passwd"}).status_code == 404
+
+
+def test_convert_blocks_path_traversal(env):
+    client, _, _, output_dir, _ = env
+    secret = output_dir.parent / "secret_flv.mp4"
+    secret.write_bytes(b"nope")
+
+    resp = client.post("/api/files/convert", params={"name": "../secret_flv.mp4"})
+    assert resp.status_code == 404
+    assert secret.read_bytes() == b"nope"
 
 
 # -- global stop / resume / pause ---------------------------------------------

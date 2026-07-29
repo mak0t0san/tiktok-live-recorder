@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from core.tiktok_recorder import TikTokRecorder
@@ -231,7 +233,9 @@ def test_stop_event_with_tiny_stream_deletes_output(tmp_path, monkeypatch):
     recorder.start_recording("creator", "1234567890")
 
     assert not converted
-    assert list(tmp_path.iterdir()) == []
+    # The per-user folder is created up front and may be left behind empty;
+    # what matters is that no recording file survives.
+    assert list(tmp_path.rglob("*.mp4")) == []
 
 
 class FlakyConnectionAPI:
@@ -623,3 +627,41 @@ def test_no_history_for_discarded_tiny_stream(tmp_path, monkeypatch):
     recorder.start_recording("creator", "1234567890")
 
     assert recorder._status.sessions == []
+
+
+def test_output_path_nests_under_a_per_user_folder(tmp_path):
+    recorder = _build_recorder(tmp_path)
+
+    output = Path(recorder._build_output_path("Creator"))
+
+    assert output.parent == tmp_path / "creator", "recordings go in a per-user folder"
+    assert output.parent.is_dir(), "the folder must exist before recording starts"
+    assert output.name.startswith("TK_Creator_")
+
+
+def test_output_path_without_output_dir_nests_relative_to_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    recorder = TikTokRecorder(
+        RecorderConfig(mode=Mode.MANUAL, user="creator", cookies={}, output=None)
+    )
+
+    output = Path(recorder._build_output_path("creator"))
+
+    assert output.parent.resolve() == (tmp_path / "creator").resolve()
+
+
+def test_output_path_falls_back_to_flat_dir_when_folder_cannot_be_created(
+    tmp_path, monkeypatch
+):
+    recorder = _build_recorder(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("core.tiktok_recorder.user_output_dir", boom)
+
+    output = Path(recorder._build_output_path("creator"))
+
+    # A live stream is not repeatable, so a broken per-user folder must not cost
+    # us the recording -- it lands flat in the output dir instead.
+    assert output.parent == tmp_path

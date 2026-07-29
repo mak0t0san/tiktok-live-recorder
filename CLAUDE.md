@@ -58,13 +58,22 @@ uv run bump-my-version bump patch   # or: minor / major
   end; keyed `(user, started_at)` so the post-conversion re-write only updates
   the output path).
 - `src/web/` — FastAPI dashboard (`-web`, needs `uv sync --extra web`):
-  `app.py` (routes + session middleware), `auth.py` (shared password →
+  `app.py` (routes + session middleware; the file APIs speak *output-relative*
+  paths — `/api/files` walks the tree with `rglob` and returns a `name` like
+  `alice/TK_alice_….mp4` plus a `user` field, and `/files` and
+  `/api/files/convert` take that name as a `?name=` **query parameter** rather
+  than a path segment so nested names survive proxies that normalise `%2F` in
+  paths; `_resolve_in_output_dir()` is the containment guard), `auth.py` (shared password →
   signed cookie), `preview.py` (on-demand HLS preview: a follower thread tails
   the growing FLV into `ffmpeg -c copy -f hls`; idle previews reaped after ~30s),
   `server.py` (bootstrap), `static/` (vanilla-JS frontend, vendored hls.js).
 - `src/core/tiktok_recorder.py` — `TikTokRecorder`: orchestrates the two recording
   modes (`manual_mode`, `automatic_mode`) and the record loop,
   including CDN-candidate fallback and flv→mp4 conversion on completion.
+  `_build_output_path()` nests every recording under `<output>/<username>/`
+  (via `utils.output_paths`), falling back to a flat write with a logged error
+  if the folder can't be created — a live stream isn't repeatable, so losing the
+  recording is worse than losing the layout.
 - `src/core/tiktok_api.py` — `TikTokAPI`: all TikTok HTTP calls — room/user resolution,
   liveness checks, live-URL candidate extraction. Room-ID
   resolution goes through a tikrec signing service first, falling back to a legacy
@@ -77,12 +86,25 @@ uv run bump-my-version bump patch   # or: minor / major
     `TikTokRecorder`.
   - `enums.py` — `Mode` (MANUAL/AUTOMATIC), `Error`, `TikTokError`,
     `Info` (holds `VERSION` and the release banner/`NEW_FEATURES`).
-  - `video_management.py` — ffmpeg-based flv→mp4 conversion.
+  - `output_paths.py` — `user_dir_name()` (case-folds a username and reduces it
+    to a safe single path component, `_unknown` if nothing survives) and
+    `user_output_dir()` (that folder, created). The case-folding matches the
+    precedent in `recording_lock()`, so `@Alice` and `@alice` share one folder.
+  - `video_management.py` — ffmpeg-based flv→mp4 conversion. `_build_output_file()`
+    rejoins on the *input's* directory, so converted files follow their
+    `_flv.mp4` source into the per-user folder — load-bearing, keep it.
   - `dependencies.py` — startup dependency/ffmpeg checks and install prompts.
   - `logger_manager.py` — singleton logger: INFO to stdout, ERROR to stderr, DEBUG+
     to rotating `tiktok-recorder.log`.
 - `src/upload/telegram.py` — optional Telethon upload to Saved Messages, enabled via
   `-telegram` and configured in `src/telegram.json`.
+- `src/tools/migrate_to_user_folders.py` — one-off, hand-run script that moves
+  pre-nesting flat recordings into their per-user folders (dry run by default,
+  `--apply` to move, never overwrites). It lives under `src/` rather than a
+  top-level `scripts/` because the Dockerfile's `COPY src/ ./` is the only path
+  into the image, and container users are the ones with legacy files to migrate.
+  Deliberately not wired into startup: moving a file out from under a live
+  ffmpeg would corrupt that recording.
 - Runtime config lives alongside source: `src/cookies.json`, `src/telegram.json`.
 - `docker/` — container packaging: `entrypoint.sh` (seeds `/config`, drops to
   `PUID:PGID` via `gosu`, maps `TLR_*` env vars to CLI flags, then execs

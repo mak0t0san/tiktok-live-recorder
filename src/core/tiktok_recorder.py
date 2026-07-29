@@ -7,6 +7,7 @@ from requests import HTTPError, RequestException
 
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
+from utils.output_paths import user_output_dir
 from utils.recorder_config import RecorderConfig
 from utils.video_management import VideoManagement
 from utils.custom_exceptions import (
@@ -183,9 +184,19 @@ class TikTokRecorder:
         filename = (
             f"TK_{user}_{time.strftime('%Y.%m.%d_%H-%M-%S', time.localtime())}_flv.mp4"
         )
-        if self.output:
-            return str(Path(self.output) / filename)
-        return filename
+        base = Path(self.output) if self.output else Path.cwd()
+        try:
+            directory = user_output_dir(base, user)
+        except OSError as e:
+            # A live stream cannot be recorded again later, so a folder we
+            # cannot create must not cost us the recording: fall back to the
+            # flat output directory and make the reason loud.
+            logger.error(
+                f"Could not create a folder for @{user} in {base}: {e}. "
+                f"Recording into {base} instead."
+            )
+            directory = base
+        return str(directory / filename)
 
     def start_recording(self, user, room_id):
         """

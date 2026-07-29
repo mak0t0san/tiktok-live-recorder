@@ -32,6 +32,12 @@ function esc(s) {
   ));
 }
 
+// /api/files reports output-relative paths ("alice/TK_alice_....mp4"); the
+// folder is already shown in its own column, so the File cell drops it.
+function basename(p) {
+  return String(p).split('/').pop();
+}
+
 function fmtBytes(n) {
   if (!n) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -335,7 +341,8 @@ async function refreshFiles() {
   const tbody = document.getElementById('files');
   tbody.innerHTML = data.files.map((f) => `
     <tr>
-      <td>${esc(f.name)}${f.raw ? ' <span class="chip">raw</span>' : ''}</td>
+      <td>${f.user ? esc(f.user) : '<span class="muted">&mdash;</span>'}</td>
+      <td>${esc(basename(f.name))}${f.raw ? ' <span class="chip">raw</span>' : ''}</td>
       <td class="num">${fmtBytes(f.size)}</td>
       <td class="num">${new Date(f.mtime * 1000).toLocaleString()}</td>
       <td>
@@ -343,7 +350,7 @@ async function refreshFiles() {
     ? `<button data-file-action="convert" data-file-name="${encodeURIComponent(f.name)}">Convert</button> `
       + `<button data-file-action="convert-scaled" data-file-name="${encodeURIComponent(f.name)}" title="Re-encode to a single consistent size (removes mid-stream resolution jumps)">Fix size</button> `
     : ''}
-        <a href="/files/${encodeURIComponent(f.name)}" download>Download</a>
+        <a href="/files?${new URLSearchParams({ name: f.name })}" download>Download</a>
       </td>
     </tr>`).join('');
   document.getElementById('files-empty').hidden = data.files.length > 0;
@@ -357,7 +364,9 @@ document.getElementById('files').addEventListener('click', async (e) => {
   const name = decodeURIComponent(convertBtn.dataset.fileName);
   const scale = convertBtn.dataset.fileAction === 'convert-scaled';
   convertBtn.disabled = true;
-  const url = `/api/files/${encodeURIComponent(name)}/convert${scale ? '?scale=1' : ''}`;
+  const params = new URLSearchParams({ name });
+  if (scale) params.set('scale', '1');
+  const url = `/api/files/convert?${params}`;
   const resp = await api(url, { method: 'POST' });
   if (!resp.ok) {
     convertBtn.disabled = false;

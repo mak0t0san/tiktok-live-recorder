@@ -135,7 +135,7 @@ uv run python src/main.py [options]
 | `-users-file <PATH>` | Path to a text file listing usernames to monitor in automatic mode, one per line (`#` starts a comment). Re-read periodically, so usernames can be added or removed while running; removing one stops its recording. Cannot be combined with `-user`, `-room_id`, or `-url`. |
 | `-mode <MODE>` | Recording mode: `manual`, `automatic`. |
 | `-automatic_interval <MIN>` | Polling interval in minutes (automatic mode only). |
-| `-output <DIRECTORY>` | Directory where recordings will be saved. |
+| `-output <DIRECTORY>` | Directory where recordings will be saved, one subfolder per user (see [Where recordings are saved](#where-recordings-are-saved)). |
 | `-duration <SECONDS>` | Stop recording after this many seconds. |
 | `-proxy <URL>` | HTTP proxy to bypass regional restrictions. |
 | `-bitrate <BITRATE>` | Output bitrate for post-processing (e.g. `1M`, `1000k`). |
@@ -151,6 +151,44 @@ uv run python src/main.py [options]
 
 - **`manual`** *(default)*: Records immediately if the user is currently live.
 - **`automatic`**: Polls at regular intervals and records whenever the user goes live.
+
+### Where recordings are saved
+
+Each user gets their own folder inside the output directory:
+
+```
+recordings/
+├── alice/
+│   └── TK_alice_2026.07.28_21-15-04.mp4
+└── some_creator_99/
+    └── TK_some_creator_99_2026.07.28_20-02-11.mp4
+```
+
+The folder name is the username lowercased and reduced to safe characters, so
+`@Alice` and `@alice` share one folder.
+
+If you recorded with an older version, those files are still sitting flat in the
+output directory. A one-off script moves them into place — run it while nothing
+is recording, since moving a file out from under a live recording would corrupt
+it:
+
+```bash
+# show what would move (default)
+uv run python src/tools/migrate_to_user_folders.py ./recordings
+
+# actually move them
+uv run python src/tools/migrate_to_user_folders.py ./recordings --apply
+```
+
+In Docker, run it against the data volume:
+
+```bash
+docker exec -it tiktok-live-recorder \
+  python /app/tools/migrate_to_user_folders.py /data --apply
+```
+
+Nothing is ever overwritten: if a file already exists at the destination, the
+script reports it as a conflict and leaves both copies alone.
 
 ## Web Dashboard
 
