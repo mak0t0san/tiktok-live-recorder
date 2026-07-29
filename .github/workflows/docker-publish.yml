@@ -50,16 +50,18 @@ jobs:
           fi
           docker run --rm --entrypoint cat tlr:smoke /app/defaults/cookies.json \
             | grep -q '"sessionid_ss": ""'
-          # No real credential value anywhere in the image. A value counts as
+          # No real credential value in JSON cookie files. A value counts as
           # real when it is neither empty nor a <placeholder>; the tracked
           # cookies.sample.json legitimately ships "<paste your ... here>".
+          # Limit to *.json: Python like utils/cookies.py maps keys to env
+          # names ("sessionid_ss": "TLR_SESSIONID_SS") and must not trip this.
           if docker run --rm --entrypoint sh tlr:smoke -c \
-              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' | grep -q .; then
+              'grep -rEl --include="*.json" "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' | grep -q .; then
             # Filenames only — never echo the matching line, or a leaked
             # credential would be republished in the workflow log.
             echo "::error::a real credential value is baked into the image, in:"
             docker run --rm --entrypoint sh tlr:smoke -c \
-              'grep -rEl "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' || true
+              'grep -rEl --include="*.json" "\"(sessionid_ss|msToken)\": *\"[^\"<][^\"]*\"" /app' || true
             exit 1
           fi
 
