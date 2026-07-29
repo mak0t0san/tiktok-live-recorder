@@ -98,9 +98,8 @@ jobs:
 
       - name: Assert state landed on the volume with the right owner
         run: |
-          test -f /tmp/tlr/data/users.txt
           test -d /tmp/tlr/data/recordings
-          test -f /tmp/tlr/config/cookies.json
+          test -f /tmp/tlr/config/telegram.json
           # Check a file the *application* creates, not one the entrypoint
           # chowns explicitly — this is what proves the gosu step-down worked.
           db=/tmp/tlr/data/recordings/.tiktok-recorder-status.sqlite3

@@ -41,9 +41,10 @@ def fake_ffmpeg(tmp_path):
 
 @pytest.fixture
 def env(tmp_path, fake_ffmpeg):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("alice\n")
     status_db = tmp_path / "status.sqlite3"
+    store = StatusStore(status_db)
+    store.add_monitored("alice")
+    store.close()
 
     source = tmp_path / "TK_alice_flv.mp4"
     source.write_bytes(b"flv-data" * 100)
@@ -60,7 +61,6 @@ def env(tmp_path, fake_ffmpeg):
     previews = PreviewManager(ffmpeg_path=str(fake_ffmpeg), idle_timeout=30)
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=users_file,
         output_dir=tmp_path,
         auth=SessionAuth(PASSWORD),
         status_db=status_db,

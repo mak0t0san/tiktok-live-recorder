@@ -75,7 +75,8 @@ class TikTokError(Enum):
 
     ACCOUNT_PRIVATE = (
         "Account is private, login required. "
-        "Please add your cookies to cookies.json "
+        "Please configure TikTok session cookies "
+        "(TLR_SESSIONID_SS / Settings in the web UI). "
         "https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies"
     )
 
@@ -85,7 +86,8 @@ class TikTokError(Enum):
 
     LIVE_RESTRICTION = (
         "Live is private, login required. "
-        "Please add your cookies to cookies.json"
+        "Please configure TikTok session cookies "
+        "(TLR_SESSIONID_SS / Settings in the web UI). "
         "https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies"
     )
 

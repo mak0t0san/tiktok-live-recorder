@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS user_settings (
 )
 """
 
+# Who is monitored by the dashboard / supervisor. Source of truth for the
+# user list (replaces the legacy users.txt file).
+_MONITORED_USERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS monitored_users (
+    user TEXT PRIMARY KEY,
+    added_at REAL NOT NULL
+)
+"""
+
 # Global (not per-user) dashboard settings, as a simple key/value bucket so
 # the dashboard can persist toggles that must survive a restart.
 _APP_SETTINGS_SCHEMA = """
@@ -104,6 +113,7 @@ class StatusStore:
         self._conn.execute(_SCHEMA)
         self._conn.execute(_PROFILES_SCHEMA)
         self._conn.execute(_USER_SETTINGS_SCHEMA)
+        self._conn.execute(_MONITORED_USERS_SCHEMA)
         self._conn.execute(_APP_SETTINGS_SCHEMA)
         self._conn.execute(_HISTORY_SCHEMA)
         self._conn.execute(_HISTORY_INDEX)
@@ -168,8 +178,118 @@ class StatusStore:
     def remove(self, user):
         self._conn.execute("DELETE FROM recordings WHERE user = ?", [user])
         self._conn.execute("DELETE FROM user_settings WHERE user = ?", [user])
+        self._conn.execute("DELETE FROM monitored_users WHERE user = ?", [user])
         self._conn.execute("DELETE FROM recording_history WHERE user = ?", [user])
         self._conn.commit()
+
+    def list_monitored(self) -> list:
+        """Monitored usernames in insertion order."""
+        cursor = self._conn.execute(
+            "SELECT user FROM monitored_users ORDER BY added_at ASC, user ASC"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def is_monitored(self, user) -> bool:
+        target = user.strip().removeprefix("@").casefold()
+        cursor = self._conn.execute("SELECT user FROM monitored_users")
+        return any(row[0].casefold() == target for row in cursor.fetchall())
+
+    def add_monitored(self, user) -> bool:
+        """
+        Add ``user`` to the monitored set. Returns False when already listed
+        (case-insensitive). Raises ValueError on invalid usernames.
+        """
+        from utils.utils import normalize_username
+
+        user = normalize_username(user)
+        if self.is_monitored(user):
+            return False
+        self._conn.execute(
+            "INSERT INTO monitored_users (user, added_at) VALUES (?, ?)",
+            [user, time.time()],
+        )
+        self._conn.commit()
+        return True
+
+    def remove_monitored(self, user) -> bool:
+        """Remove ``user`` from the monitored set. Returns False if absent."""
+        target = user.strip().removeprefix("@")
+        if not target:
+            return False
+        # Match case-insensitively but delete by the stored key.
+        cursor = self._conn.execute("SELECT user FROM monitored_users")
+        matched = next(
+            (
+                row[0]
+                for row in cursor.fetchall()
+                if row[0].casefold() == target.casefold()
+            ),
+            None,
+        )
+        if matched is None:
+            return False
+        self._conn.execute("DELETE FROM monitored_users WHERE user = ?", [matched])
+        self._conn.commit()
+        return True
+
+    def replace_monitored(self, users) -> list:
+        """Replace the monitored set; returns the normalized list stored."""
+        from utils.utils import normalize_username
+
+        normalized = []
+        seen = set()
+        for raw in users:
+            try:
+                name = normalize_username(raw)
+            except ValueError:
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(name)
+        now = time.time()
+        self._conn.execute("DELETE FROM monitored_users")
+        self._conn.executemany(
+            "INSERT INTO monitored_users (user, added_at) VALUES (?, ?)",
+            [(name, now + i * 0.001) for i, name in enumerate(normalized)],
+        )
+        self._conn.commit()
+        return normalized
+
+    def merge_monitored(self, users) -> list:
+        """Add any missing usernames; returns the list of newly added names."""
+        from utils.utils import normalize_username
+
+        added = []
+        for raw in users:
+            try:
+                name = normalize_username(raw)
+            except ValueError:
+                continue
+            if self.add_monitored(name):
+                added.append(name)
+        return added
+
+    def migrate_users_file_if_needed(self, path) -> list:
+        """
+        If the monitored set is empty and ``path`` exists, import usernames
+        from the legacy users.txt. Returns the imported list (empty if skipped).
+        """
+        if self.list_monitored():
+            return []
+        path = Path(path)
+        if not path.is_file():
+            return []
+        from utils.utils import read_users_file
+
+        try:
+            users = read_users_file(path)
+        except OSError:
+            return []
+        if not users:
+            return []
+        return self.replace_monitored(users)
 
     def set_paused(self, user, paused):
         """Persist whether ``user``'s monitoring is paused."""

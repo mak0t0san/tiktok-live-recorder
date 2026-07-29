@@ -95,13 +95,16 @@ uv run python src/main.py -h
 <summary>Docker 🐳</summary>
 
 The image runs the web dashboard and is configured with environment variables.
-Two volumes: `/config` for credentials, `/data` for everything else (recordings,
-`users.txt`, the status database, the log).
+Two volumes: `/config` for optional credentials (`telegram.json`, legacy
+`cookies.json`), `/data` for recordings, the status database, and the log.
 
 ```bash
 docker run -d --name tiktok-live-recorder \
   -p 8000:8000 \
   -e TLR_WEB_PASSWORD=changeme \
+  -e TLR_SESSIONID_SS='your-sessionid_ss' \
+  -e TLR_TT_TARGET_IDC=useast8 \
+  -e TLR_MSTOKEN='your-msToken' \
   -e PUID=$(id -u) -e PGID=$(id -g) \
   -v ./config:/config \
   -v ./data:/data \
@@ -129,11 +132,9 @@ uv run python src/main.py [options]
 
 | Flag | Description |
 |------|-------------|
-| `-user <USERNAME>` | Username(s) to record. Separate multiple with commas. |
-| `-url <URL>` | TikTok live URL to record from. |
-| `-room_id <ROOM_ID>` | Room ID to record from. |
-| `-users-file <PATH>` | Path to a text file listing usernames to monitor in automatic mode, one per line (`#` starts a comment). Re-read periodically, so usernames can be added or removed while running; removing one stops its recording. Cannot be combined with `-user`, `-room_id`, or `-url`. |
-| `-mode <MODE>` | Recording mode: `manual`, `automatic`. |
+| `-url <URL>` | TikTok live URL for a one-shot recording (without `-web`). |
+| `-room_id <ROOM_ID>` | Room ID for a one-shot recording (without `-web`). |
+| `-mode <MODE>` | Recording mode: `manual`, `automatic`. Ignored with `-web` (always automatic). |
 | `-automatic_interval <MIN>` | Polling interval in minutes (automatic mode only). |
 | `-output <DIRECTORY>` | Directory where recordings will be saved, one subfolder per user (see [Where recordings are saved](#where-recordings-are-saved)). |
 | `-duration <SECONDS>` | Stop recording after this many seconds. |
@@ -141,7 +142,7 @@ uv run python src/main.py [options]
 | `-bitrate <BITRATE>` | Output bitrate for post-processing (e.g. `1M`, `1000k`). |
 | `-scale` | Re-encode the recording to a single consistent size (the highest resolution seen anywhere in the recording) so TikTok's mid-stream resolution changes don't make the video shrink and grow on playback. Slower and slightly lossy. |
 | `-telegram` | Upload the recording to Telegram when done. Requires `telegram.json`. |
-| `-web` | Start the web dashboard instead of the plain CLI (see [Web Dashboard](#web-dashboard)). |
+| `-web` | Start the web dashboard (primary mode; see [Web Dashboard](#web-dashboard)). |
 | `-web-host <HOST>` | Interface for the web dashboard. Default: `0.0.0.0` (all interfaces). |
 | `-web-port <PORT>` | Port for the web dashboard. Default: `8000`. |
 | `-web-password <PASSWORD>` | Password for the web dashboard (or set `TLR_WEB_PASSWORD`). |
@@ -192,28 +193,32 @@ script reports it as a conflict and leaves both copies alone.
 
 ## Web Dashboard
 
-A browser UI for managing recordings, built on the automatic users-file mode:
+A browser UI for managing monitored users, TikTok session cookies, and
+recordings. This is the primary way to run the app (especially in Docker /
+TrueNAS):
 
 ```bash
 # one-time: install the web extra
 uv sync --extra web
 
-# start the dashboard (creates users.txt if missing)
+# start the dashboard
 TLR_WEB_PASSWORD=changeme uv run python src/main.py -web -output ./recordings
 ```
 
 Then open `http://<your-machine>:8000` from any device on your network and log
 in with the password. From the dashboard you can:
 
-- **Add or remove monitored users** — edits the same users file the CLI uses,
-  so the two stay interchangeable.
+- **Add or remove monitored users** — stored in the status database (not a
+  text file). Use **Export** / **Import** to move a username list between
+  installs (plain `users.txt` format: one name per line).
+- **Configure TikTok cookies** — paste `sessionid_ss`, `tt-target-idc`, and
+  `msToken` in Settings, or set `TLR_SESSIONID_SS` / `TLR_TT_TARGET_IDC` /
+  `TLR_MSTOKEN` (env wins and those fields become read-only in the UI).
 - **Watch recordings in progress** — live state, duration, and file size per
   user, updated every couple of seconds.
 - **Stop individual recordings** — a stop finalizes the file (flush + MP4
   conversion) instead of killing the recorder mid-write; **Resume** restarts
-  monitoring afterwards. Stops are persistent: a stopped (paused) user stays
-  paused across dashboard restarts until you resume them, without losing
-  their place in the users file.
+  monitoring afterwards. Stops are persistent across dashboard restarts.
 - **Check now** — trigger an immediate liveness check for a waiting user
   instead of waiting out the recheck interval (default 5 minutes).
 - **Sort the user grid** — by recording status, username, or display name;
@@ -252,13 +257,14 @@ zfs create <pool>/<parent>/tiktok-recordings
 chown 568:568 /mnt/<pool>/<parent>/tiktok-recordings
 ```
 
-This becomes `/data`: recordings, `users.txt`, the status database and the log.
+This becomes `/data`: recordings, the status database and the log.
 It grows with every recording, so keep it somewhere you can share over SMB and
 snapshot on its own schedule. It must be a local ZFS path — the status database
 runs SQLite in WAL mode and will corrupt on an NFS- or SMB-backed mount.
 
-`/config` holds just `cookies.json` and `telegram.json`. How you provide it
-depends on which install route you take, below.
+`/config` is optional for TikTok cookies (prefer env vars or the Settings UI)
+and still holds `telegram.json` if you use Telegram uploads. How you provide
+it depends on which install route you take, below.
 
 **2a. Install via YAML** *(one paste, recommended)*. **Apps → Discover**, ⋮ menu,
 **Install via YAML**, and paste [`docker/truenas-compose.yaml`](docker/truenas-compose.yaml)
@@ -275,37 +281,45 @@ under Storage add two mounts:
 
 | Mount path | Type | Notes |
 |------------|------|-------|
-| `/config` | **ixVolume** named `config` | TrueNAS creates and owns it under `<pool>/ix-apps/app_mounts/<appname>/`. Deleting the app can delete it, taking `cookies.json` with it — use a host path instead if that matters. |
+| `/config` | **ixVolume** named `config` | TrueNAS creates and owns it under `<pool>/ix-apps/app_mounts/<appname>/`. Used for `telegram.json` (and optional legacy `cookies.json`). |
 | `/data` | **Host Path** | The dataset from step 1. |
 
 The container must start as **root** so it can seed `/config` and fix
 ownership; it drops to `PUID:PGID` itself before recording anything. If the
 Security Context section exposes a run-as user, set it to `0`.
 
-**3. Add your cookies.** TikTok calls work better authenticated. The container
-seeds an empty template on first start; paste a valid session cookie into the
-`cookies.json` on your `/config` mount. The dashboard's diagnostics panel
-reports the exact path and whether it picked the cookie up.
+**3. Add your cookies.** TikTok calls work better authenticated. Prefer one of:
 
-Then open `http://<truenas-ip>:8000` and log in.
+1. Set `TLR_SESSIONID_SS` (and optionally `TLR_TT_TARGET_IDC` / `TLR_MSTOKEN`)
+   as environment variables in the TrueNAS app form / Compose file, or
+2. Log into the dashboard and paste them under **Settings**.
 
-Upgrades are a pull-and-recreate: nothing mutable lives in the image, so your
-user list, recordings, history and cookies all survive. If you previously ran
-the container as root, `chown -R 568:568` the datasets once — the entrypoint
-only fixes ownership of the top-level directories, since recursing through a
-recordings dataset on every restart would be far too slow.
+Env vars win over Settings (those fields become read-only when locked by the
+environment). A legacy `cookies.json` on `/config` is migrated into Settings
+once on first start if nothing else is configured. The diagnostics panel
+reports whether a session cookie is present and where it came from.
+
+Then open `http://<truenas-ip>:8000` and log in. Add users in the UI (or
+**Import** a plain-text list). Upgrades are a pull-and-recreate: nothing
+mutable lives in the image, so your user list, recordings, history and saved
+cookies all survive on `/data`. If you previously ran the container as root,
+`chown -R 568:568` the datasets once — the entrypoint only fixes ownership of
+the top-level directories, since recursing through a recordings dataset on
+every restart would be far too slow.
 
 ### Container environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TLR_WEB_PASSWORD` | *(unset)* | Dashboard password. A random one is logged at startup if unset. |
+| `TLR_SESSIONID_SS` | *(unset)* | TikTok `sessionid_ss` cookie (preferred over Settings / cookies.json). |
+| `TLR_TT_TARGET_IDC` | *(unset)* | TikTok `tt-target-idc` cookie (e.g. `useast8`). |
+| `TLR_MSTOKEN` | *(unset)* | TikTok `msToken` cookie. |
 | `PUID` / `PGID` | `568` | User the recorder runs as; owns everything it writes. `568` is the TrueNAS `apps` user. |
 | `TZ` | `UTC` | Timezone for log and filename timestamps. |
 | `TLR_WEB_PORT` | `8000` | Port inside the container. |
 | `TLR_WEB_HOST` | `0.0.0.0` | Bind address. Leave as-is; a container must not bind to loopback. |
 | `TLR_OUTPUT` | `/data/recordings` | Where recordings, the status database and the avatar cache go. |
-| `TLR_USERS_FILE` | `/data/users.txt` | Monitored-user list. |
 | `TLR_SCALE` | `true` | Re-encode to one consistent resolution (the `-scale` flag). Set `false` to stream-copy. |
 | `TLR_INTERVAL` | `5` | Minutes between liveness checks. |
 | `TLR_PROXY` | *(unset)* | HTTP proxy for TikTok requests. |
@@ -317,7 +331,7 @@ Compose `command:` list; the entrypoint appends it to the generated arguments.
 
 ## Guide
 
-- [How to set cookies in cookies.json](https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies)
+- [How to set cookies](https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-set-cookies) (browser values for env vars / Settings)
 - [How to get room_id](https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-get-room_id)
 - [How to enable upload to Telegram](https://github.com/Michele0303/tiktok-live-recorder/blob/main/docs/GUIDE.md#how-to-enable-upload-to-telegram)
 

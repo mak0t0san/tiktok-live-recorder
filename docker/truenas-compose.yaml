@@ -31,6 +31,12 @@ services:
       # password on every start.
       TLR_WEB_PASSWORD: change-me
 
+      # TikTok session cookies (preferred). Alternatively paste them in the
+      # web UI under Settings after first login.
+      # TLR_SESSIONID_SS: "..."
+      # TLR_TT_TARGET_IDC: useast8
+      # TLR_MSTOKEN: "..."
+
       # 568 is TrueNAS SCALE's built-in `apps` user, so recordings land on the
       # dataset with sane ownership.
       PUID: "568"
@@ -51,13 +57,13 @@ services:
       - "8000:8000"
 
     volumes:
-      # cookies.json + telegram.json. Small, worth snapshotting often.
+      # Optional telegram.json (+ legacy cookies.json). Small.
       - /mnt/<pool>/<parent>/tiktok-recorder-config:/config
-      # Working directory: recordings/, users.txt, the status SQLite DB and
-      # the log. Keep this on a normal dataset you can share and snapshot on
-      # its own schedule — it grows with every recording. It must also be a
-      # local ZFS path: the status DB runs SQLite in WAL mode and will corrupt
-      # on an NFS or SMB backed mount.
+      # Working directory: recordings/, the status SQLite DB and the log.
+      # Keep this on a normal dataset you can share and snapshot on its own
+      # schedule — it grows with every recording. It must also be a local
+      # ZFS path: the status DB runs SQLite in WAL mode and will corrupt on
+      # an NFS or SMB backed mount.
       - /mnt/<pool>/<parent>/tiktok-recordings:/data
 
     # Live-preview HLS segments are written to a temp dir. Keeping them in RAM

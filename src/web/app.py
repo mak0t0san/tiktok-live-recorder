@@ -2,21 +2,32 @@
 FastAPI application for the web dashboard.
 
 The app is a thin HTTP layer: process control goes through the Supervisor,
-recording state comes from the SQLite status store, and the list of monitored
-users lives in the users file (shared with the CLI).
+recording state and the monitored-user list come from the SQLite status
+store, and TikTok session cookies are resolved from env vars + Settings.
 """
 
-import json
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from utils.utils import add_user_to_file, read_users_file, remove_user_from_file
+from utils.cookies import (
+    COOKIE_KEYS,
+    cookie_status,
+    env_cookie_sources,
+    resolve_cookies,
+    save_cookies_to_store,
+)
 from utils.status_store import StatusStore
+from utils.utils import parse_users_text
 from utils.video_management import VideoManagement
 from web.auth import SESSION_COOKIE, SESSION_MAX_AGE
 from web.profiles import AVATAR_CACHE_DIRNAME
@@ -40,13 +51,22 @@ class StopBody(BaseModel):
 
 
 class SettingsBody(BaseModel):
-    scale: bool
+    scale: bool | None = None
+    sessionid_ss: str | None = None
+    tt_target_idc: str | None = Field(default=None, alias="tt-target-idc")
+    msToken: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ImportBody(BaseModel):
+    text: str = ""
+    mode: str = "merge"  # merge | replace
 
 
 def create_app(
     *,
     supervisor,
-    users_file,
     output_dir,
     auth,
     status_db,
@@ -54,9 +74,28 @@ def create_app(
     ffmpeg_path="ffmpeg",
 ):
     app = FastAPI(title="TikTok Live Recorder", docs_url=None, redoc_url=None)
-    users_file = Path(users_file)
     output_dir = Path(output_dir)
     avatar_dir = output_dir / AVATAR_CACHE_DIRNAME
+
+    def _open_store():
+        return StatusStore(status_db)
+
+    def _monitored_users(store=None):
+        owns = store is None
+        if owns:
+            store = _open_store()
+        try:
+            return store.list_monitored()
+        finally:
+            if owns:
+                store.close()
+
+    def _is_monitored(user: str) -> bool:
+        store = _open_store()
+        try:
+            return store.is_monitored(user)
+        finally:
+            store.close()
 
     @app.middleware("http")
     async def require_session(request, call_next):
@@ -103,11 +142,11 @@ def create_app(
 
     @app.get("/api/status")
     def status():
-        users = read_users_file(users_file)
         procs = supervisor.snapshot()
 
-        store = StatusStore(status_db)
+        store = _open_store()
         try:
+            users = store.list_monitored()
             rows = {row["user"]: row for row in store.all()}
             profile_rows = store.profiles()
             paused_set = store.paused_users()
@@ -170,18 +209,22 @@ def create_app(
             headers={"Cache-Control": "max-age=3600"},
         )
 
-    # -- users file ---------------------------------------------------------
+    # -- monitored users ----------------------------------------------------
 
     @app.get("/api/users")
     def list_users():
-        return {"users": read_users_file(users_file)}
+        return {"users": _monitored_users()}
 
     @app.post("/api/users")
     def add_user(body: UserBody):
+        store = _open_store()
         try:
-            added = add_user_to_file(users_file, body.user)
-        except ValueError as e:
-            return JSONResponse({"detail": str(e)}, status_code=422)
+            try:
+                added = store.add_monitored(body.user)
+            except ValueError as e:
+                return JSONResponse({"detail": str(e)}, status_code=422)
+        finally:
+            store.close()
         if not added:
             return JSONResponse({"detail": "User already listed"}, status_code=409)
         supervisor.sync_users()
@@ -189,21 +232,84 @@ def create_app(
 
     @app.delete("/api/users/{user}")
     def delete_user(user: str):
-        removed = remove_user_from_file(users_file, user)
-        supervisor.remove_user(user, reason="removed via web UI")
-        store = StatusStore(status_db)
+        store = _open_store()
         try:
-            store.remove(user)
+            removed = store.remove_monitored(user)
+            if removed:
+                store.remove(user)
         finally:
             store.close()
+        supervisor.remove_user(user, reason="removed via web UI")
         if not removed:
             return JSONResponse({"detail": "User not listed"}, status_code=404)
         return {"ok": True}
 
+    @app.get("/api/users/export")
+    def export_users():
+        users = _monitored_users()
+        body = "\n".join(users) + ("\n" if users else "")
+        return PlainTextResponse(
+            body,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="users.txt"',
+            },
+        )
+
+    @app.post("/api/users/import")
+    async def import_users(request: Request, mode: str = "merge"):
+        """
+        Import usernames from a plain-text body (one per line, ``#`` comments
+        allowed) or a JSON ``{"text": "...", "mode": "merge"|"replace"}``.
+        """
+        content_type = (request.headers.get("content-type") or "").lower()
+        import_mode = mode
+        if "application/json" in content_type:
+            payload = await request.json()
+            if isinstance(payload, dict):
+                text = payload.get("text", "")
+                import_mode = payload.get("mode", import_mode) or "merge"
+            else:
+                return JSONResponse(
+                    {"detail": "Expected a JSON object"}, status_code=422
+                )
+        else:
+            text = (await request.body()).decode("utf-8", errors="replace")
+
+        import_mode = (import_mode or "merge").lower()
+        if import_mode not in ("merge", "replace"):
+            return JSONResponse(
+                {"detail": "mode must be 'merge' or 'replace'"}, status_code=422
+            )
+
+        users = parse_users_text(text)
+        store = _open_store()
+        try:
+            if import_mode == "replace":
+                # Stop processes for users that will disappear before replacing.
+                previous = set(store.list_monitored())
+                kept = store.replace_monitored(users)
+                for gone in previous - set(kept):
+                    supervisor.remove_user(gone, reason="removed via import")
+                added = [u for u in kept if u not in previous]
+            else:
+                added = store.merge_monitored(users)
+                kept = store.list_monitored()
+        finally:
+            store.close()
+        supervisor.sync_users()
+        return {
+            "ok": True,
+            "mode": import_mode,
+            "added": added,
+            "users": kept,
+            "count": len(kept),
+        }
+
     # -- recording control --------------------------------------------------
 
     def _persist_paused(users, paused):
-        store = StatusStore(status_db)
+        store = _open_store()
         try:
             for user in users:
                 store.set_paused(user, paused)
@@ -234,20 +340,83 @@ def create_app(
 
     # -- settings -----------------------------------------------------------
 
+    def _settings_payload(store=None):
+        owns = store is None
+        if owns:
+            store = _open_store()
+        try:
+            status = cookie_status(store)
+            resolved = resolve_cookies(store)
+            cookies_out = {}
+            for key in COOKIE_KEYS:
+                value = resolved.get(key) or ""
+                cookies_out[key] = {
+                    "set": bool(value),
+                    "source": status["cookies_sources"].get(key, "missing"),
+                    "env_locked": bool(status["cookies_env_locked"].get(key)),
+                    # Non-secret hint only (never return full session values).
+                    "hint": value[-4:] if value and key != "tt-target-idc" else value,
+                }
+            return {
+                "scale": bool(getattr(supervisor, "scale", False)),
+                "cookies": cookies_out,
+                "cookies_present": status["cookies_present"],
+                "cookies_hint": status["cookies_hint"],
+            }
+        finally:
+            if owns:
+                store.close()
+
     @app.get("/api/settings")
     def get_settings():
-        return {"scale": bool(getattr(supervisor, "scale", False))}
+        return _settings_payload()
 
     @app.post("/api/settings")
     def update_settings(body: SettingsBody):
-        supervisor.set_scale(body.scale)
-        return {"ok": True, "scale": body.scale}
+        if body.scale is not None:
+            supervisor.set_scale(body.scale)
+
+        incoming = {
+            "sessionid_ss": body.sessionid_ss,
+            "tt-target-idc": body.tt_target_idc,
+            "msToken": body.msToken,
+        }
+        # Empty / omitted => leave unchanged; skip env-locked keys.
+        locked = env_cookie_sources()
+        to_save = {
+            key: value
+            for key, value in incoming.items()
+            if value is not None and str(value).strip() and not locked.get(key)
+        }
+        skipped_locked = [
+            key
+            for key, value in incoming.items()
+            if value is not None and str(value).strip() and locked.get(key)
+        ]
+
+        store = _open_store()
+        try:
+            if to_save:
+                save_cookies_to_store(store, to_save)
+                cookies = resolve_cookies(store)
+                if hasattr(supervisor, "update_cookies"):
+                    supervisor.update_cookies(cookies)
+                else:
+                    supervisor.cookies = cookies
+            payload = _settings_payload(store)
+        finally:
+            store.close()
+
+        payload["ok"] = True
+        if skipped_locked:
+            payload["skipped_env_locked"] = skipped_locked
+        return payload
 
     @app.post("/api/recordings/{user}/stop")
     def stop_recording(user: str, body: StopBody | None = None):
-        # Keyed on the users file (not on a live process) so a user paused at
+        # Keyed on membership (not on a live process) so a user paused at
         # startup — who has no process — can still be managed.
-        if user not in read_users_file(users_file):
+        if not _is_monitored(user):
             return JSONResponse({"detail": "User is not monitored"}, 404)
         if not supervisor.stop_user(user, force=bool(body and body.force)):
             # no live process: still exclude the user from future restarts
@@ -257,7 +426,7 @@ def create_app(
 
     @app.post("/api/recordings/{user}/resume")
     def resume_recording(user: str):
-        if user not in read_users_file(users_file):
+        if not _is_monitored(user):
             return JSONResponse({"detail": "User is not monitored"}, 404)
         _persist_paused([user], False)
         supervisor.resume_user(user)
@@ -274,7 +443,7 @@ def create_app(
     # -- completed recordings -----------------------------------------------
 
     def _active_raw_outputs() -> set[Path]:
-        store = StatusStore(status_db)
+        store = _open_store()
         try:
             rows = store.all()
         finally:
@@ -429,48 +598,20 @@ def create_app(
         """
         Return a snapshot of key service health indicators that the dashboard
         can display as a diagnostics panel.
-
-        Fields
-        ------
-        cookies_file      : str          — path to cookies.json
-        cookies_present   : bool         — file holds a non-empty sessionid_ss
-        cookies_hint      : str          — actionable advice
-
-        tikrec_url        : str          — tikrec signing service base URL
-        tikrec_reachable  : bool | null  — probe result
-        tikrec_detail     : str | null   — human-readable probe outcome
         """
-        result: dict = {}
-
-        # --- cookies ---
-        cookies_path = Path(__file__).parent.parent / "cookies.json"
-        if cookies_path.is_symlink():
-            # In the container this points at the /config volume, which is the
-            # path the user can actually edit.
-            cookies_path = cookies_path.resolve()
-        # Check for an actual session value rather than file size: a seeded
-        # template with empty values is well over any size threshold but is
-        # not usable, which would report a false "cookies found".
+        store = _open_store()
         try:
-            cookies_present = bool(
-                json.loads(cookies_path.read_text(encoding="utf-8")).get("sessionid_ss")
-            )
-        except (OSError, ValueError):
-            cookies_present = False
-        result["cookies_file"] = str(cookies_path)
-        result["cookies_present"] = cookies_present
-        result["cookies_hint"] = (
-            "cookies.json found — if TikTok calls fail, try refreshing the "
-            "session cookies."
-            if cookies_present
-            else (
-                f"No TikTok session cookie configured. Add a valid "
-                f"'sessionid_ss' to {cookies_path} to enable authenticated "
-                f"requests."
-            )
-        )
+            status = cookie_status(store)
+        finally:
+            store.close()
 
-        # --- tikrec ---
+        result = {
+            "cookies_present": status["cookies_present"],
+            "cookies_sources": status["cookies_sources"],
+            "cookies_hint": status["cookies_hint"],
+            "cookies_env_locked": status["cookies_env_locked"],
+        }
+
         tikrec_url = "https://tikrec.com"
         result["tikrec_url"] = tikrec_url
         tikrec_reachable, tikrec_detail = _probe_health(tikrec_url, timeout=6)

@@ -2,11 +2,11 @@
 Process supervision for multi-user recording.
 
 One ``multiprocessing.Process`` records each monitored user. The supervisor
-keeps the process table in sync with the users file, restarts dead processes
-with exponential backoff, and supports per-user cooperative stop: each child
-gets a ``multiprocessing.Event`` that ``TikTokRecorder`` polls, so a stop
-finalizes (flush + convert) an in-flight recording instead of killing it
-mid-file. Used by the CLI users-file loop and by the web UI.
+keeps the process table in sync with the monitored-users list in the status
+DB, restarts dead processes with exponential backoff, and supports per-user
+cooperative stop: each child gets a ``multiprocessing.Event`` that
+``TikTokRecorder`` polls, so a stop finalizes (flush + convert) an in-flight
+recording instead of killing it mid-file. Used by the web UI.
 """
 
 import multiprocessing
@@ -16,7 +16,6 @@ import time
 from utils.enums import TimeOut
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
-from utils.utils import read_users_file
 
 
 def record_user(config):
@@ -125,8 +124,8 @@ class Supervisor:
     """
     Owns the user -> recorder-process table.
 
-    Thread-safe: the users-file poll loop and web request handlers may call
-    into the same instance concurrently.
+    Thread-safe: the poll loop and web request handlers may call into the
+    same instance concurrently.
     """
 
     RESTART_BASE = TimeOut.USERS_FILE_POLL  # seconds
@@ -160,6 +159,17 @@ class Supervisor:
                 logger.debug("Could not load scale setting", exc_info=True)
         self._restart_state = {}  # user -> {"count", "next_allowed", "started"}
         self._lock = threading.RLock()
+
+    def _list_monitored(self) -> list:
+        if not self.status_db:
+            return []
+        from utils.status_store import StatusStore
+
+        store = StatusStore(self.status_db)
+        try:
+            return store.list_monitored()
+        finally:
+            store.close()
 
     def start_user(self, user):
         with self._lock:
@@ -240,11 +250,11 @@ class Supervisor:
         return [user for user in users if self.stop_user(user, force=force)]
 
     def resume_all(self):
-        """Undo stop_user/stop_all for every stopped user in the users file."""
+        """Undo stop_user/stop_all for every stopped monitored user."""
         try:
-            users = read_users_file(self.args.users_file)
+            users = self._list_monitored()
         except OSError as e:
-            logger.error(f"Failed to read users file: {e}")
+            logger.error(f"Failed to read monitored users: {e}")
             return []
         resumed = []
         with self._lock:
@@ -316,7 +326,25 @@ class Supervisor:
             + ("enabled" if enabled else "disabled")
         )
 
-    def remove_user(self, user, reason="removed from users file"):
+    def update_cookies(self, cookies):
+        """
+        Replace the cookie dict used for newly spawned recorders, then
+        restart every live monitored process so they pick up the new session.
+        """
+        with self._lock:
+            self.cookies = cookies
+            users = [
+                user
+                for user, p in self.processes.items()
+                if p.is_alive() and user not in self.stopped_users
+            ]
+        for user in users:
+            self.remove_user(user, reason="cookies updated")
+            if not self.paused:
+                self.start_user(user)
+                logger.info(f"Restarted monitoring @{user} after cookie update")
+
+    def remove_user(self, user, reason="removed from monitored users"):
         """Stop monitoring ``user`` entirely and forget its state."""
         with self._lock:
             p = self.processes.pop(user, None)
@@ -337,11 +365,11 @@ class Supervisor:
         logger.info(f"Stopped monitoring @{user} ({reason})")
 
     def sync_users(self):
-        """Reconcile the process table with the users file."""
+        """Reconcile the process table with the monitored-users list."""
         try:
-            users = read_users_file(self.args.users_file)
-        except OSError as e:
-            logger.error(f"Failed to read users file: {e}")
+            users = self._list_monitored()
+        except Exception as e:
+            logger.error(f"Failed to read monitored users: {e}")
             return
 
         now = time.time()

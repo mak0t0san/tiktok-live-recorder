@@ -25,11 +25,35 @@
   button.primary { background: #fe2c55; color: #fff; }
   button.danger { background: #7a2030; }
   button:disabled { opacity: .45; cursor: default; }
-  #add-form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  #add-form { display: flex; gap: .5rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
   #add-user {
-    font: inherit; flex: 1; max-width: 320px; padding: .45rem .7rem;
+    font: inherit; flex: 1; min-width: 180px; max-width: 320px; padding: .45rem .7rem;
     border-radius: 8px; border: 1px solid #333; background: #16161c; color: inherit;
   }
+  .settings {
+    background: #1a1a22; border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 1.4rem;
+  }
+  .settings h2 { margin-top: 0; }
+  .settings-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: .7rem .9rem; margin-top: .6rem;
+  }
+  .settings label.field {
+    display: flex; flex-direction: column; gap: .3rem; font-size: .8rem; color: #9aa;
+  }
+  .settings input[type="text"], .settings input[type="password"] {
+    font: inherit; padding: .45rem .7rem; border-radius: 8px;
+    border: 1px solid #333; background: #16161c; color: inherit;
+  }
+  .settings input:disabled { opacity: .55; }
+  .settings .hint { font-size: .8rem; color: #778; margin: .55rem 0 0; }
+  .settings .row-actions { display: flex; gap: .5rem; margin-top: .85rem; flex-wrap: wrap; }
+  .badge {
+    display: inline-block; font-size: .68rem; padding: .1rem .4rem; border-radius: 999px;
+    background: #2a2a35; color: #9aa; margin-left: .35rem; text-transform: uppercase;
+  }
+  .badge.env { background: #23324a; color: #9fc3ff; }
+  #import-file { display: none; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: .9rem; }
   .card {
     background: #1a1a22; border-radius: 12px; padding: .9rem 1rem;
@@ -111,6 +135,26 @@
 </header>
 <main>
   <p id="paused-banner" hidden>⏸ Monitoring paused — no recordings will start until you resume.</p>
+
+  <section class="settings" id="settings">
+    <h2>Settings</h2>
+    <p class="hint" id="cookies-hint">Configure TikTok session cookies here, or via TLR_SESSIONID_SS / TLR_TT_TARGET_IDC / TLR_MSTOKEN.</p>
+    <div class="settings-grid">
+      <label class="field">sessionid_ss <span class="badge" id="badge-sessionid_ss" hidden></span>
+        <input type="password" id="cookie-sessionid_ss" autocomplete="off" placeholder="paste sessionid_ss">
+      </label>
+      <label class="field">tt-target-idc <span class="badge" id="badge-tt-target-idc" hidden></span>
+        <input type="text" id="cookie-tt-target-idc" autocomplete="off" placeholder="e.g. useast8">
+      </label>
+      <label class="field">msToken <span class="badge" id="badge-msToken" hidden></span>
+        <input type="password" id="cookie-msToken" autocomplete="off" placeholder="paste msToken">
+      </label>
+    </div>
+    <div class="row-actions">
+      <button class="primary" type="button" id="save-cookies">Save cookies</button>
+    </div>
+  </section>
+
   <div class="section-head">
     <h2>Monitored users</h2>
     <select id="sort-select" aria-label="Sort users">
@@ -118,6 +162,9 @@
       <option value="user">Sort: username</option>
       <option value="name">Sort: name</option>
     </select>
+    <button id="export-users" type="button">Export</button>
+    <button id="import-users" type="button">Import</button>
+    <input type="file" id="import-file" accept=".txt,text/plain">
     <button id="resume-all" hidden>Resume all</button>
     <button id="stop-all" class="danger" hidden>Stop all</button>
   </div>

@@ -434,6 +434,140 @@ document.getElementById('scale-toggle').addEventListener('change', async (e) => 
   refresh();
 });
 
+/* -- cookie settings + user import/export -------------------------------- */
+
+const COOKIE_FIELDS = [
+  ['sessionid_ss', 'cookie-sessionid_ss', 'badge-sessionid_ss'],
+  ['tt-target-idc', 'cookie-tt-target-idc', 'badge-tt-target-idc'],
+  ['msToken', 'cookie-msToken', 'badge-msToken'],
+];
+
+async function loadSettings() {
+  const resp = await api('/api/settings');
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const hint = document.getElementById('cookies-hint');
+  if (hint && data.cookies_hint) hint.textContent = data.cookies_hint;
+
+  for (const [key, inputId, badgeId] of COOKIE_FIELDS) {
+    const meta = (data.cookies || {})[key] || {};
+    const input = document.getElementById(inputId);
+    const badge = document.getElementById(badgeId);
+    if (!input) continue;
+    if (meta.env_locked) {
+      input.disabled = true;
+      input.placeholder = meta.hint
+        ? `set via environment (…${meta.hint})`
+        : 'set via environment';
+      input.value = '';
+      if (badge) {
+        badge.hidden = false;
+        badge.textContent = 'env';
+        badge.classList.add('env');
+      }
+    } else {
+      input.disabled = false;
+      if (meta.set && key === 'tt-target-idc' && meta.hint) {
+        input.placeholder = meta.hint;
+      } else if (meta.set && meta.hint) {
+        input.placeholder = `saved (…${meta.hint}) — leave blank to keep`;
+      }
+      if (badge) {
+        if (meta.set) {
+          badge.hidden = false;
+          badge.textContent = meta.source || 'set';
+          badge.classList.remove('env');
+        } else {
+          badge.hidden = true;
+        }
+      }
+    }
+  }
+}
+
+document.getElementById('save-cookies').addEventListener('click', async () => {
+  const body = {};
+  for (const [key, inputId] of COOKIE_FIELDS) {
+    const input = document.getElementById(inputId);
+    if (!input || input.disabled) continue;
+    const value = input.value.trim();
+    if (value) body[key] = value;
+  }
+  if (!Object.keys(body).length) {
+    alert('Enter at least one cookie value to save (leave blank to keep existing).');
+    return;
+  }
+  const resp = await api('/api/settings', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    alert(data.detail || 'Could not save cookies');
+    return;
+  }
+  for (const [, inputId] of COOKIE_FIELDS) {
+    const input = document.getElementById(inputId);
+    if (input && !input.disabled) input.value = '';
+  }
+  await loadSettings();
+  if (data.skipped_env_locked && data.skipped_env_locked.length) {
+    alert('Some cookies are locked by environment variables and were not saved.');
+  }
+});
+
+document.getElementById('export-users').addEventListener('click', async () => {
+  const resp = await api('/api/users/export');
+  if (!resp.ok) {
+    alert('Could not export users');
+    return;
+  }
+  const text = await resp.text();
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'users.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById('import-users').addEventListener('click', () => {
+  document.getElementById('import-file').click();
+});
+
+document.getElementById('import-file').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const text = await file.text();
+  const choice = prompt(
+    'Import mode:\n'
+    + '  merge   — add new names, keep existing (default)\n'
+    + '  replace — replace the entire monitored list\n\n'
+    + 'Type merge or replace:',
+    'merge'
+  );
+  if (choice === null) return;
+  const mode = choice.trim().toLowerCase() === 'replace' ? 'replace' : 'merge';
+  if (mode === 'replace'
+    && !confirm('Replace the entire monitored user list with this file?')) {
+    return;
+  }
+  const resp = await api('/api/users/import', {
+    method: 'POST',
+    body: JSON.stringify({ text, mode }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    alert(data.detail || 'Could not import users');
+    return;
+  }
+  alert(`Imported (${mode}). Now monitoring ${data.count} user(s) `
+    + `(${(data.added || []).length} added).`);
+  refresh();
+});
+
 const sortSelect = document.getElementById('sort-select');
 sortSelect.value = localStorage.getItem('tlr-sort') || 'status';
 sortSelect.addEventListener('change', () => {
@@ -441,6 +575,7 @@ sortSelect.addEventListener('change', () => {
   refresh();
 });
 
+loadSettings();
 refresh();
 refreshFiles();
 setInterval(refresh, 2000);

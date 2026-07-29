@@ -8,7 +8,7 @@ from pathlib import Path
 from utils.logger_manager import logger
 
 
-def run_web(args, mode, cookies):
+def run_web(args, mode):
     try:
         import uvicorn
     except ImportError:
@@ -19,6 +19,7 @@ def run_web(args, mode, cookies):
 
     from core.supervisor import Supervisor, install_shutdown_handlers
     from core.tiktok_api import TikTokAPI
+    from utils.cookies import migrate_legacy_cookies_file, resolve_cookies
     from utils.status_store import StatusStore, status_db_path
     from web.app import create_app
     from web.auth import SessionAuth
@@ -35,14 +36,34 @@ def run_web(args, mode, cookies):
         )
 
     output_dir = Path(args.output) if args.output else Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
     status_db = status_db_path(output_dir)
 
-    supervisor = Supervisor(args, mode, cookies, status_db=status_db)
     store = StatusStore(status_db)
     try:
-        supervisor.preseed_stopped(store.paused_users())
+        # One-time migrations from the legacy file-based config.
+        legacy_users = Path(
+            os.environ.get("TLR_USERS_FILE")
+            or getattr(args, "users_file", None)
+            or Path.cwd() / "users.txt"
+        )
+        imported = store.migrate_users_file_if_needed(legacy_users)
+        if imported:
+            logger.info(
+                f"Migrated {len(imported)} user(s) from {legacy_users} into "
+                "the status database."
+            )
+        if migrate_legacy_cookies_file(store):
+            logger.info(
+                "Migrated TikTok session cookies from cookies.json into Settings."
+            )
+        cookies = resolve_cookies(store)
+        paused = store.paused_users()
     finally:
         store.close()
+
+    supervisor = Supervisor(args, mode, cookies, status_db=status_db)
+    supervisor.preseed_stopped(paused)
     supervisor.sync_users()
     install_shutdown_handlers(supervisor.processes)
 
@@ -52,11 +73,10 @@ def run_web(args, mode, cookies):
     previews = PreviewManager(ffmpeg_path=args.ffmpeg_path or "ffmpeg")
 
     def api_factory():
-        return TikTokAPI(proxy=args.proxy, cookies=cookies)
+        return TikTokAPI(proxy=args.proxy, cookies=supervisor.cookies)
 
     profiles = ProfileRefresher(
         status_db=status_db,
-        users_file=args.users_file,
         api_factory=api_factory,
         cache_dir=output_dir / AVATAR_CACHE_DIRNAME,
     )
@@ -64,7 +84,6 @@ def run_web(args, mode, cookies):
 
     app = create_app(
         supervisor=supervisor,
-        users_file=args.users_file,
         output_dir=output_dir,
         auth=SessionAuth(password),
         status_db=status_db,

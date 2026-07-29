@@ -41,11 +41,12 @@ class FakeAPI:
 
 
 def _refresher(tmp_path, api, users=("alice",), **kwargs):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("".join(f"{u}\n" for u in users))
+    store = StatusStore(tmp_path / "status.sqlite3")
+    for user in users:
+        store.add_monitored(user)
+    store.close()
     return ProfileRefresher(
         status_db=tmp_path / "status.sqlite3",
-        users_file=users_file,
         api_factory=lambda: api,
         cache_dir=tmp_path / "avatars",
         per_user_delay=0,
@@ -126,17 +127,14 @@ def test_run_once_handles_unknown_user(tmp_path):
     assert _profiles(tmp_path)["alice"]["nickname"] is None
 
 
-def test_pathlike_usernames_never_touch_disk(tmp_path):
-    api = FakeAPI()
-    refresher = _refresher(tmp_path, api, users=("alice",))
-
-    # simulate a hostile users file entry that already has an avatar URL
+def test_pathlike_usernames_rejected_on_add(tmp_path):
     store = StatusStore(tmp_path / "status.sqlite3")
-    store.upsert_profile("../evil", avatar_url="http://cdn/x.jpg")
-    store.close()
-    refresher.users_file.write_text("../evil\n")
-
-    refresher.run_once()
-
-    assert not (tmp_path / "evil.jpg").exists()
-    assert api.http_client.urls == []
+    try:
+        for bad in ("../evil", "a/b", "a\\b", ".."):
+            try:
+                store.add_monitored(bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"expected ValueError for {bad!r}")
+    finally:
+        store.close()

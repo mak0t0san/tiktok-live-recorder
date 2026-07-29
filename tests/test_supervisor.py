@@ -18,7 +18,6 @@ def make_args(**overrides):
         bitrate=None,
         scale=False,
         ffmpeg_path=None,
-        users_file="users.txt",
     )
     for key, value in overrides.items():
         setattr(args, key, value)

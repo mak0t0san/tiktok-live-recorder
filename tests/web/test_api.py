@@ -22,10 +22,15 @@ class FakeSupervisor:
         self.procs = {}
         self.paused = False
         self.scale = False
+        self.cookies = {}
 
     def set_scale(self, enabled):
         self.calls.append(("set_scale", enabled))
         self.scale = bool(enabled)
+
+    def update_cookies(self, cookies):
+        self.calls.append(("update_cookies", dict(cookies)))
+        self.cookies = dict(cookies)
 
     def snapshot(self):
         return self.procs
@@ -69,11 +74,14 @@ class FakeSupervisor:
 
 @pytest.fixture
 def env(tmp_path):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("alice\nbob\n")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     status_db = tmp_path / "status.sqlite3"
+
+    store = StatusStore(status_db)
+    store.add_monitored("alice")
+    store.add_monitored("bob")
+    store.close()
 
     supervisor = FakeSupervisor()
     supervisor.procs = {
@@ -83,20 +91,18 @@ def env(tmp_path):
 
     app = create_app(
         supervisor=supervisor,
-        users_file=users_file,
         output_dir=output_dir,
         auth=SessionAuth(PASSWORD),
         status_db=status_db,
     )
     client = TestClient(app)
     client.post("/api/login", json={"password": PASSWORD})
-    return client, supervisor, users_file, output_dir, status_db
+    return client, supervisor, status_db, output_dir
 
 
 def test_api_requires_login(tmp_path):
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=tmp_path / "users.txt",
         output_dir=tmp_path,
         auth=SessionAuth(PASSWORD),
         status_db=tmp_path / "status.sqlite3",
@@ -104,17 +110,14 @@ def test_api_requires_login(tmp_path):
     client = TestClient(app)
 
     assert client.get("/api/status").status_code == 401
-    # pages redirect to the login form instead
     page = client.get("/", follow_redirects=False)
     assert page.status_code == 307
     assert page.headers["location"] == "/login"
 
 
 def test_wrong_password_rejected(tmp_path):
-    (tmp_path / "users.txt").write_text("")
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=tmp_path / "users.txt",
         output_dir=tmp_path,
         auth=SessionAuth(PASSWORD),
         status_db=tmp_path / "status.sqlite3",
@@ -125,7 +128,7 @@ def test_wrong_password_rejected(tmp_path):
 
 
 def test_status_merges_process_and_store(env):
-    client, supervisor, _, _, status_db = env
+    client, supervisor, status_db, _ = env
 
     store = StatusStore(status_db)
     store.update(
@@ -139,40 +142,77 @@ def test_status_merges_process_and_store(env):
     assert by_user["alice"]["state"] == "recording"
     assert by_user["alice"]["bytes_written"] == 4096
     assert by_user["alice"]["alive"] is True
-    # bob has a process but no status row yet
     assert by_user["bob"]["state"] == "starting"
 
 
 def test_add_user_appends_and_syncs(env):
-    client, supervisor, users_file, _, _ = env
+    client, supervisor, status_db, _ = env
 
     resp = client.post("/api/users", json={"user": "@carol"})
     assert resp.status_code == 200
-    assert "carol" in users_file.read_text()
+    store = StatusStore(status_db)
+    try:
+        assert "carol" in store.list_monitored()
+    finally:
+        store.close()
     assert ("sync_users",) in supervisor.calls
 
 
 def test_add_duplicate_user_conflicts(env):
-    client, _, _, _, _ = env
+    client, _, _, _ = env
     assert client.post("/api/users", json={"user": "alice"}).status_code == 409
 
 
 def test_add_invalid_user_rejected(env):
-    client, _, _, _, _ = env
+    client, _, _, _ = env
     assert client.post("/api/users", json={"user": "has space"}).status_code == 422
 
 
-def test_delete_user_rewrites_file_and_removes_process(env):
-    client, supervisor, users_file, _, _ = env
+def test_delete_user_removes_and_stops_process(env):
+    client, supervisor, status_db, _ = env
 
     resp = client.delete("/api/users/bob")
     assert resp.status_code == 200
-    assert "bob" not in users_file.read_text()
+    store = StatusStore(status_db)
+    try:
+        assert "bob" not in store.list_monitored()
+    finally:
+        store.close()
     assert ("remove_user", "bob") in supervisor.calls
 
 
+def test_export_and_import_users(env):
+    client, supervisor, status_db, _ = env
+
+    exported = client.get("/api/users/export")
+    assert exported.status_code == 200
+    assert exported.text == "alice\nbob\n"
+
+    resp = client.post(
+        "/api/users/import",
+        json={"text": "carol\n# comment\n@dave\n", "mode": "merge"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body["added"]) == {"carol", "dave"}
+    assert set(body["users"]) == {"alice", "bob", "carol", "dave"}
+    assert ("sync_users",) in supervisor.calls
+
+    resp = client.post(
+        "/api/users/import",
+        json={"text": "erin\n", "mode": "replace"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["users"] == ["erin"]
+    store = StatusStore(status_db)
+    try:
+        assert store.list_monitored() == ["erin"]
+    finally:
+        store.close()
+
+
 def test_stop_and_resume_call_supervisor(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     assert client.post("/api/recordings/alice/stop").status_code == 200
     assert ("stop_user", "alice", False) in supervisor.calls
@@ -188,7 +228,7 @@ def test_stop_and_resume_call_supervisor(env):
 
 
 def test_stop_unknown_user_404(env):
-    client, _, _, _, _ = env
+    client, _, _, _ = env
     assert client.post("/api/recordings/ghost/stop").status_code == 404
 
 
@@ -201,7 +241,7 @@ def _paused_users(status_db):
 
 
 def test_stop_persists_pause_and_resume_clears_it(env):
-    client, _, _, _, status_db = env
+    client, _, status_db, _ = env
 
     client.post("/api/recordings/alice/stop")
     assert _paused_users(status_db) == {"alice"}
@@ -216,10 +256,11 @@ def test_stop_persists_pause_and_resume_clears_it(env):
 
 
 def test_stop_user_without_process_still_persists(env):
-    client, supervisor, users_file, _, status_db = env
-    users_file.write_text("alice\nbob\ncarol\n")
+    client, supervisor, status_db, _ = env
+    store = StatusStore(status_db)
+    store.add_monitored("carol")
+    store.close()
 
-    # carol is in the users file but has no process (e.g. paused at startup)
     resp = client.post("/api/recordings/carol/stop")
     assert resp.status_code == 200
     assert _paused_users(status_db) == {"carol"}
@@ -227,7 +268,7 @@ def test_stop_user_without_process_still_persists(env):
 
 
 def test_stop_all_and_resume_all_persist_pause(env):
-    client, _, _, _, status_db = env
+    client, _, status_db, _ = env
 
     client.post("/api/recordings/stop-all")
     assert _paused_users(status_db) == {"alice", "bob"}
@@ -237,7 +278,7 @@ def test_stop_all_and_resume_all_persist_pause(env):
 
 
 def test_delete_user_clears_persisted_state(env):
-    client, _, _, _, status_db = env
+    client, _, status_db, _ = env
 
     store = StatusStore(status_db)
     store.set_paused("bob", True)
@@ -255,7 +296,7 @@ def test_delete_user_clears_persisted_state(env):
 
 
 def test_check_now_endpoint(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     resp = client.post("/api/recordings/alice/check-now")
     assert resp.status_code == 200
@@ -265,7 +306,7 @@ def test_check_now_endpoint(env):
 
 
 def test_status_includes_last_recording_history(env):
-    client, _, _, _, status_db = env
+    client, _, status_db, _ = env
 
     store = StatusStore(status_db)
     store.add_history("alice", started_at=100.0, ended_at=160.0, bytes_written=9)
@@ -279,7 +320,7 @@ def test_status_includes_last_recording_history(env):
 
 
 def test_files_listing_and_download(env):
-    client, _, _, output_dir, status_db = env
+    client, _, status_db, output_dir = env
     (output_dir / "TK_alice_2026.07.17_10-00-00.mp4").write_bytes(b"video")
     (output_dir / "TK_bob_2026.07.17_10-00-00_flv.mp4").write_bytes(b"raw")
     active_raw = output_dir / "TK_carol_2026.07.17_10-00-00_flv.mp4"
@@ -303,7 +344,6 @@ def test_files_listing_and_download(env):
     assert by_name["TK_bob_2026.07.17_10-00-00_flv.mp4"]["convertible"] is True
     assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["raw"] is True
     assert by_name["TK_carol_2026.07.17_10-00-00_flv.mp4"]["convertible"] is False
-    # recordings made before per-user folders existed sit at the output root
     assert by_name["TK_alice_2026.07.17_10-00-00.mp4"]["user"] is None
 
     resp = client.get("/files", params={"name": "TK_alice_2026.07.17_10-00-00.mp4"})
@@ -312,7 +352,7 @@ def test_files_listing_and_download(env):
 
 
 def test_files_listing_walks_per_user_folders(env):
-    client, _, _, output_dir, status_db = env
+    client, _, _, output_dir = env
     (output_dir / "TK_legacy_2026.07.17_10-00-00.mp4").write_bytes(b"flat")
     alice_dir = output_dir / "alice"
     alice_dir.mkdir()
@@ -322,16 +362,13 @@ def test_files_listing_walks_per_user_folders(env):
     files = client.get("/api/files").json()["files"]
     by_name = {f["name"]: f for f in files}
 
-    # names are output-relative POSIX paths so the same string round-trips
-    # through the download and convert endpoints
     assert by_name["alice/TK_alice_2026.07.18_10-00-00.mp4"]["user"] == "alice"
     assert by_name["alice/TK_alice_2026.07.18_11-00-00_flv.mp4"]["convertible"] is True
-    # legacy flat files stay visible
     assert by_name["TK_legacy_2026.07.17_10-00-00.mp4"]["user"] is None
 
 
 def test_download_nested_file_by_relative_path(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     alice_dir = output_dir / "alice"
     alice_dir.mkdir()
     (alice_dir / "TK_alice_2026.07.18_10-00-00.mp4").write_bytes(b"nested")
@@ -344,7 +381,7 @@ def test_download_nested_file_by_relative_path(env):
 
 
 def test_convert_nested_raw_file(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     alice_dir = output_dir / "alice"
     alice_dir.mkdir()
     raw = alice_dir / "TK_alice_2026.07.18_10-00-00_flv.mp4"
@@ -354,14 +391,10 @@ def test_convert_nested_raw_file(env):
         "/api/files/convert",
         params={"name": "alice/TK_alice_2026.07.18_10-00-00_flv.mp4"},
     )
-    # ffmpeg is not stubbed here, so the conversion itself fails -- what matters
-    # is that the nested path was accepted rather than 404'd by the guard
     assert resp.status_code != 404
 
 
 def test_convert_returns_an_output_relative_name(tmp_path, monkeypatch):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("")
     output_dir = tmp_path / "out"
     (output_dir / "alice").mkdir(parents=True)
     raw = output_dir / "alice" / "TK_alice_2026.07.18_10-00-00_flv.mp4"
@@ -377,7 +410,6 @@ def test_convert_returns_an_output_relative_name(tmp_path, monkeypatch):
 
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=users_file,
         output_dir=output_dir,
         auth=SessionAuth(PASSWORD),
         status_db=tmp_path / "status.sqlite3",
@@ -390,13 +422,10 @@ def test_convert_returns_an_output_relative_name(tmp_path, monkeypatch):
         params={"name": "alice/TK_alice_2026.07.18_10-00-00_flv.mp4"},
     )
     assert resp.status_code == 200
-    # the frontend feeds this straight back into the download link
     assert resp.json() == {"ok": True, "name": "alice/TK_alice_2026.07.18_10-00-00.mp4"}
 
 
 def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     status_db = tmp_path / "status.sqlite3"
@@ -418,7 +447,6 @@ def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
 
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=users_file,
         output_dir=output_dir,
         auth=SessionAuth(PASSWORD),
         status_db=status_db,
@@ -438,8 +466,6 @@ def test_convert_raw_file_uses_configured_ffmpeg_path(tmp_path, monkeypatch):
 
 
 def test_convert_scale_query_forwards_scale(tmp_path, monkeypatch):
-    users_file = tmp_path / "users.txt"
-    users_file.write_text("")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     status_db = tmp_path / "status.sqlite3"
@@ -459,7 +485,6 @@ def test_convert_scale_query_forwards_scale(tmp_path, monkeypatch):
 
     app = create_app(
         supervisor=FakeSupervisor(),
-        users_file=users_file,
         output_dir=output_dir,
         auth=SessionAuth(PASSWORD),
         status_db=status_db,
@@ -473,7 +498,7 @@ def test_convert_scale_query_forwards_scale(tmp_path, monkeypatch):
 
 
 def test_convert_rejects_non_raw_file(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     file = output_dir / "TK_alice_2026.07.17_10-00-00.mp4"
     file.write_bytes(b"video")
 
@@ -483,7 +508,7 @@ def test_convert_rejects_non_raw_file(env):
 
 
 def test_convert_rejects_active_raw_file(env):
-    client, _, _, output_dir, status_db = env
+    client, _, status_db, output_dir = env
     raw = output_dir / "TK_alice_2026.07.17_10-00-00_flv.mp4"
     raw.write_bytes(b"raw")
 
@@ -503,7 +528,7 @@ def test_convert_rejects_active_raw_file(env):
 
 
 def test_convert_rejects_active_raw_file_in_a_per_user_folder(env):
-    client, _, _, output_dir, status_db = env
+    client, _, status_db, output_dir = env
     alice_dir = output_dir / "alice"
     alice_dir.mkdir()
     raw = alice_dir / "TK_alice_2026.07.18_10-00-00_flv.mp4"
@@ -529,12 +554,11 @@ def test_convert_rejects_active_raw_file_in_a_per_user_folder(env):
 
 
 def test_convert_matches_active_recordings_by_path_not_basename(env):
-    client, _, _, output_dir, status_db = env
+    client, _, status_db, output_dir = env
     alice_dir = output_dir / "alice"
     alice_dir.mkdir()
     bob_dir = output_dir / "bob"
     bob_dir.mkdir()
-    # same basename in two folders: only alice's copy is being recorded
     active = alice_dir / "TK_x_2026.07.18_10-00-00_flv.mp4"
     active.write_bytes(b"raw")
     idle = bob_dir / "TK_x_2026.07.18_10-00-00_flv.mp4"
@@ -556,7 +580,7 @@ def test_convert_matches_active_recordings_by_path_not_basename(env):
 
 
 def test_download_blocks_path_traversal(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     secret = output_dir.parent / "secret.mp4"
     secret.write_bytes(b"nope")
 
@@ -569,7 +593,7 @@ def test_download_blocks_path_traversal(env):
 
 
 def test_convert_blocks_path_traversal(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     secret = output_dir.parent / "secret_flv.mp4"
     secret.write_bytes(b"nope")
 
@@ -578,11 +602,8 @@ def test_convert_blocks_path_traversal(env):
     assert secret.read_bytes() == b"nope"
 
 
-# -- global stop / resume / pause ---------------------------------------------
-
-
 def test_stop_all_and_resume_all(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     resp = client.post("/api/recordings/stop-all")
     assert resp.status_code == 200
@@ -598,7 +619,7 @@ def test_stop_all_and_resume_all(env):
 
 
 def test_pause_and_resume_monitoring(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     assert client.get("/api/status").json()["paused"] is False
 
@@ -614,11 +635,8 @@ def test_pause_and_resume_monitoring(env):
     assert client.get("/api/status").json()["paused"] is False
 
 
-# -- settings (size normalization toggle) --------------------------------------
-
-
 def test_status_exposes_scale_flag(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     assert client.get("/api/status").json()["scale"] is False
 
@@ -627,38 +645,57 @@ def test_status_exposes_scale_flag(env):
 
 
 def test_get_settings_reflects_supervisor(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
-    assert client.get("/api/settings").json() == {"scale": False}
+    data = client.get("/api/settings").json()
+    assert data["scale"] is False
+    assert "cookies" in data
     supervisor.scale = True
-    assert client.get("/api/settings").json() == {"scale": True}
+    assert client.get("/api/settings").json()["scale"] is True
 
 
 def test_post_settings_toggles_scale(env):
-    client, supervisor, _, _, _ = env
+    client, supervisor, _, _ = env
 
     resp = client.post("/api/settings", json={"scale": True})
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "scale": True}
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["scale"] is True
     assert ("set_scale", True) in supervisor.calls
     assert supervisor.scale is True
 
-    # and back off again
     client.post("/api/settings", json={"scale": False})
     assert ("set_scale", False) in supervisor.calls
     assert supervisor.scale is False
 
 
-def test_post_settings_requires_scale_field(env):
-    client, _, _, _, _ = env
-    assert client.post("/api/settings", json={}).status_code == 422
+def test_post_settings_saves_cookies(env):
+    client, supervisor, status_db, _ = env
 
+    resp = client.post(
+        "/api/settings",
+        json={
+            "sessionid_ss": "abc123",
+            "tt-target-idc": "useast8",
+            "msToken": "tok",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cookies_present"] is True
+    assert any(c[0] == "update_cookies" for c in supervisor.calls)
 
-# -- profiles / avatars ---------------------------------------------------------
+    store = StatusStore(status_db)
+    try:
+        from utils.cookies import setting_key
+
+        assert store.get_setting(setting_key("sessionid_ss")) == "abc123"
+    finally:
+        store.close()
 
 
 def test_status_includes_profile_fields(env):
-    client, _, _, output_dir, status_db = env
+    client, _, status_db, output_dir = env
 
     store = StatusStore(status_db)
     store.upsert_profile("alice", nickname="Alice A", avatar_url="http://cdn/a.jpg")
@@ -671,13 +708,12 @@ def test_status_includes_profile_fields(env):
 
     assert by_user["alice"]["nickname"] == "Alice A"
     assert by_user["alice"]["avatar"] == "/api/avatar/alice"
-    # bob has no profile row and no cached avatar
     assert by_user["bob"]["nickname"] is None
     assert by_user["bob"]["avatar"] is None
 
 
 def test_avatar_served_from_cache(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     avatar_dir = output_dir / ".tlr-avatar-cache"
     avatar_dir.mkdir()
     (avatar_dir / "alice.jpg").write_bytes(b"jpeg-bytes")
@@ -689,7 +725,7 @@ def test_avatar_served_from_cache(env):
 
 
 def test_avatar_blocks_path_traversal(env):
-    client, _, _, output_dir, _ = env
+    client, _, _, output_dir = env
     (output_dir / ".tlr-avatar-cache").mkdir()
     secret = output_dir / "secret.jpg"
     secret.write_bytes(b"nope")

@@ -23,31 +23,9 @@ def parse_args():
     )
 
     parser.add_argument(
-        "-user",
-        dest="user",
-        help="Record a live session from the TikTok username.",
-        action="store",
-    )
-
-    parser.add_argument(
         "-room_id",
         dest="room_id",
         help="Record a live session from the TikTok room ID.",
-        action="store",
-    )
-
-    parser.add_argument(
-        "-users-file",
-        dest="users_file",
-        help=(
-            "Path to a text file listing TikTok usernames to monitor in automatic "
-            "mode, one per line ('#' starts a comment).\n"
-            "The file is re-read periodically, so usernames can be added or "
-            "removed while the program is running without restarting it.\n"
-            "Removing a username stops its monitoring process, terminating any "
-            "in-progress recording without conversion.\n"
-            "Cannot be combined with -user, -room_id, or -url."
-        ),
         action="store",
     )
 
@@ -57,7 +35,8 @@ def parse_args():
         help=(
             "Recording mode: (manual, automatic) [Default: manual]\n"
             "[manual] => Manual live recording.\n"
-            "[automatic] => Automatic live recording when the user is live."
+            "[automatic] => Automatic live recording when the user is live.\n"
+            "Ignored when -web is set (dashboard always uses automatic)."
         ),
         default="manual",
         action="store",
@@ -139,10 +118,10 @@ def parse_args():
         dest="web",
         action="store_true",
         help=(
-            "Start the web dashboard instead of the plain CLI.\n"
-            "Monitors the users file (default: users.txt, created if missing) "
-            "and serves a UI to manage users, watch and stop recordings, and "
-            "preview live streams.\n"
+            "Start the web dashboard (primary mode).\n"
+            "Manage monitored users, TikTok session cookies, and recordings "
+            "from the UI. Cookies can also be supplied via TLR_SESSIONID_SS / "
+            "TLR_TT_TARGET_IDC / TLR_MSTOKEN.\n"
             "Requires the 'web' extra: uv sync --extra web"
         ),
     )
@@ -194,22 +173,20 @@ def validate_and_parse_args():
     args = parse_args()
 
     if args.web:
-        if args.user or args.room_id or args.url:
+        if args.room_id or args.url:
             raise ArgsParseError(
-                "-web cannot be combined with -user, -room_id, or -url; "
+                "-web cannot be combined with -room_id or -url; "
                 "manage users from the web UI instead."
             )
         if args.mode not in ("manual", "automatic"):
             raise ArgsParseError("-web only supports automatic mode.")
-        # the dashboard drives the users-file automatic mode
         args.mode = "automatic"
-        if not args.users_file:
-            args.users_file = "users.txt"
-        try:
-            with open(args.users_file, "a", encoding="utf-8"):
-                pass
-        except OSError as e:
-            raise ArgsParseError(f"Cannot create users file: {e}")
+    else:
+        if not args.room_id and not args.url:
+            raise ArgsParseError(
+                "Missing target. Use -web to run the dashboard, or provide "
+                "-url or -room_id for a one-shot recording."
+            )
 
     if not args.mode:
         raise ArgsParseError(
@@ -220,45 +197,13 @@ def validate_and_parse_args():
             "Incorrect mode value. Choose between 'manual' or 'automatic'."
         )
 
-    if args.users_file:
-        if args.mode != "automatic":
-            raise ArgsParseError("-users-file is only supported with -mode automatic.")
-        if args.user or args.room_id or args.url:
-            raise ArgsParseError(
-                "-users-file cannot be combined with -user, -room_id, or -url."
-            )
-        if not os.path.isfile(args.users_file):
-            raise ArgsParseError(f"Users file not found: {args.users_file}")
-
-    if not args.user and not args.room_id and not args.url and not args.users_file:
-        raise ArgsParseError(
-            "Missing URL, username, or room ID. Please provide one of these parameters."
-        )
-
-    if args.user:
-        args.user = [
-            u.strip().removeprefix("@") for u in args.user.split(",") if u.strip()
-        ]
-
-    if args.user and len(args.user) > 1 and (args.room_id or args.url):
-        raise ArgsParseError(
-            "When using multiple usernames, do not provide room_id or url."
-        )
-
     if args.url and not re.match(str(Regex.IS_TIKTOK_LIVE), args.url):
         raise ArgsParseError(
             "The provided URL does not appear to be a valid TikTok live URL."
         )
 
-    if (
-        (args.user and args.room_id)
-        or (args.user and args.url)
-        or (args.room_id and args.url)
-    ):
-        raise ArgsParseError("Please provide only one among username, room ID, or URL.")
-
-    if args.user and len(args.user) == 1:
-        args.user = args.user[0]
+    if args.room_id and args.url:
+        raise ArgsParseError("Please provide only one among room ID or URL.")
 
     if args.automatic_interval < 1:
         raise ArgsParseError(

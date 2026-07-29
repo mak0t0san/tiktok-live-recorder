@@ -13,7 +13,6 @@ from pathlib import Path
 
 from utils.logger_manager import logger
 from utils.status_store import StatusStore
-from utils.utils import read_users_file
 
 # Hidden avatar-image cache, created alongside the recordings/status DB.
 AVATAR_CACHE_DIRNAME = ".tlr-avatar-cache"
@@ -24,7 +23,6 @@ class ProfileRefresher:
         self,
         *,
         status_db,
-        users_file,
         api_factory,
         cache_dir,
         profile_ttl=24 * 3600,
@@ -34,7 +32,6 @@ class ProfileRefresher:
         batch_limit=10,
     ):
         self.status_db = status_db
-        self.users_file = users_file
         self.api_factory = api_factory
         self.cache_dir = Path(cache_dir)
         self.profile_ttl = profile_ttl
@@ -57,15 +54,12 @@ class ProfileRefresher:
 
     def run_once(self):
         """One refresh pass; extracted from the thread loop for testability."""
-        try:
-            users = read_users_file(self.users_file)
-        except OSError as e:
-            logger.debug(f"Profile refresh skipped, users file unreadable: {e}")
-            return
-
         store = StatusStore(self.status_db)
         api = None
         try:
+            users = store.list_monitored()
+            if not users:
+                return
             api = self._refresh_profiles(store, users)
             api = self._refresh_avatars(store, users, api)
         finally:

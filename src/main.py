@@ -5,79 +5,17 @@ import multiprocessing
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def run_recordings_from_file(args, mode, cookies):
-    from core.supervisor import Supervisor, install_shutdown_handlers, terminate_all
-    from utils.logger_manager import logger
-    from utils.status_store import StatusStore, status_db_path
-
-    supervisor = Supervisor(args, mode, cookies)
-
-    # Honor pauses persisted by the web dashboard, but never create the status
-    # DB from a plain CLI run.
-    db = status_db_path(args.output)
-    if db.exists():
-        store = StatusStore(db)
-        try:
-            supervisor.preseed_stopped(store.paused_users())
-        finally:
-            store.close()
-
-    supervisor.sync_users()
-    if not supervisor.processes and not supervisor.stopped_users:
-        logger.error("No users found in the users file to monitor.")
-        return
-
-    install_shutdown_handlers(supervisor.processes)
-
-    try:
-        supervisor.run_forever()
-    except KeyboardInterrupt:
-        print("\n[!] Ctrl-C detected.")
-        try:
-            for p in supervisor.processes.values():
-                p.join()
-        except KeyboardInterrupt:
-            print("\n[!] Forcefully terminating all processes.")
-            terminate_all(supervisor.processes)
-
-
 def run_recordings(args, mode, cookies):
-    from core.supervisor import (
-        build_config,
-        install_shutdown_handlers,
-        record_user,
-        terminate_all,
-    )
+    from core.supervisor import build_config, record_user
 
-    if args.users_file:
-        run_recordings_from_file(args, mode, cookies)
-    elif isinstance(args.user, list):
-        processes = []
-        for user in args.user:
-            config = build_config(args, mode, cookies, user=user)
-            p = multiprocessing.Process(target=record_user, args=(config,))
-            p.start()
-            processes.append(p)
-        install_shutdown_handlers(processes)
-        try:
-            for p in processes:
-                p.join()
-        except KeyboardInterrupt:
-            print("\n[!] Ctrl-C detected.")
-            try:
-                for p in processes:
-                    p.join()
-            except KeyboardInterrupt:
-                print("\n[!] Forcefully terminating all processes.")
-                terminate_all(processes)
-    else:
-        config = build_config(args, mode, cookies, user=args.user)
-        record_user(config)
+    config = build_config(args, mode, cookies, user=None)
+    # One-shot -url / -room_id recording (no multi-user supervisor).
+    record_user(config)
 
 
 def main():
     from utils.args_handler import validate_and_parse_args
-    from utils.utils import read_cookies
+    from utils.cookies import resolve_cookies
     from utils.logger_manager import logger
     from utils.custom_exceptions import TikTokRecorderError
     from utils.dependencies import check_ffmpeg
@@ -98,9 +36,6 @@ def main():
         else:
             logger.info("Skipped update check\n")
 
-        # read cookies from the config file
-        cookies = read_cookies()
-
         # warn (don't block) if another instance is already running: the real
         # duplicate-recording guard is the per-user lock, but running multiple
         # whole instances is a common way to end up with duplicate recordings
@@ -117,12 +52,13 @@ def main():
         else:
             atexit.register(instance_lock.release)
 
-        # run the web dashboard or the recordings based on the parsed arguments
+        # run the web dashboard or a one-shot recording
         if getattr(args, "web", False):
             from web.server import run_web
 
-            run_web(args, mode, cookies)
+            run_web(args, mode)
         else:
+            cookies = resolve_cookies(None)
             run_recordings(args, mode, cookies)
 
     except TikTokRecorderError as ex:

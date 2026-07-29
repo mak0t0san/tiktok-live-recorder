@@ -3,9 +3,10 @@
 # Container entrypoint for the TikTok Live Recorder web dashboard.
 #
 # Runs as root to seed /config and fix ownership, then drops to PUID:PGID.
-# The process working directory is /data, which is what makes users.txt,
+# The process working directory is /data, which is what makes
 # tiktok-recorder.log and .tiktok-recorder.lock land on the mounted volume —
-# the app resolves all three relative to the cwd.
+# the app resolves both relative to the cwd. Recordings and the status DB
+# live under TLR_OUTPUT (default /data/recordings).
 #
 set -euo pipefail
 
@@ -20,7 +21,6 @@ DEFAULTS_DIR="${TLR_DEFAULTS_DIR:-/app/defaults}"
 APP_DIR="${TLR_APP_DIR:-/app}"
 
 TLR_OUTPUT="${TLR_OUTPUT:-$DATA_DIR/recordings}"
-TLR_USERS_FILE="${TLR_USERS_FILE:-$DATA_DIR/users.txt}"
 TLR_WEB_PORT="${TLR_WEB_PORT:-8000}"
 TLR_WEB_HOST="${TLR_WEB_HOST:-0.0.0.0}"
 
@@ -35,9 +35,9 @@ is_true() {
 
 # --- config files ---------------------------------------------------------
 #
-# cookies.json and telegram.json are resolved relative to the source tree
-# (src/utils/utils.py, src/web/app.py), which is baked into the image. Seed
-# them into the /config volume and symlink them back so edits persist.
+# telegram.json is still resolved relative to the source tree. Seed it into
+# the /config volume and symlink it back so edits persist. cookies.json is
+# optional legacy fallback — prefer TLR_SESSIONID_SS / Settings in the UI.
 mkdir -p "$CONFIG_DIR"
 for name in cookies.json telegram.json; do
   if [[ ! -e "$CONFIG_DIR/$name" ]]; then
@@ -50,7 +50,6 @@ done
 # --- data dir -------------------------------------------------------------
 
 mkdir -p "$DATA_DIR" "$TLR_OUTPUT"
-touch "$TLR_USERS_FILE"
 
 # Ownership is fixed non-recursively on purpose: a recursive chown over a
 # recordings dataset would take minutes-to-hours on every restart. Pre-existing
@@ -58,7 +57,7 @@ touch "$TLR_USERS_FILE"
 # `chown -R` (see the TrueNAS section of the README).
 chown "$PUID:$PGID" "$DATA_DIR" "$CONFIG_DIR" "$TLR_OUTPUT"
 chown "$PUID:$PGID" "$CONFIG_DIR"/*.json 2>/dev/null || true
-for f in "$TLR_USERS_FILE" "$DATA_DIR"/tiktok-recorder.log* \
+for f in "$DATA_DIR"/tiktok-recorder.log* \
   "$DATA_DIR"/.tiktok-recorder.lock; do
   if [[ -e "$f" ]]; then
     chown "$PUID:$PGID" "$f"
@@ -67,14 +66,14 @@ done
 
 # --- build the command line ----------------------------------------------
 #
-# TLR_WEB_PASSWORD is deliberately absent here: src/web/server.py reads it
-# straight from the environment, so it never appears in the process list.
+# TLR_WEB_PASSWORD and TikTok cookie env vars are deliberately absent here:
+# Python reads them straight from the environment, so they never appear in
+# the process list.
 args=(
   -web
   -web-host "$TLR_WEB_HOST"
   -web-port "$TLR_WEB_PORT"
   -output "$TLR_OUTPUT"
-  -users-file "$TLR_USERS_FILE"
 )
 
 if is_true "${TLR_SCALE:-true}"; then
@@ -99,6 +98,10 @@ fi
 
 if [[ -z "${TLR_WEB_PASSWORD:-}" ]]; then
   echo "[!] TLR_WEB_PASSWORD is not set; a random password will be printed below."
+fi
+
+if [[ -z "${TLR_SESSIONID_SS:-}" ]]; then
+  echo "[!] TLR_SESSIONID_SS is not set; configure TikTok cookies in the web Settings UI, or set TLR_SESSIONID_SS / TLR_TT_TARGET_IDC / TLR_MSTOKEN."
 fi
 
 cd "$DATA_DIR"
